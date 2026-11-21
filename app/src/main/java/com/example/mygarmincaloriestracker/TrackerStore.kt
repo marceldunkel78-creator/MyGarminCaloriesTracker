@@ -15,7 +15,10 @@ data class Food(val id: Long, val name: String, val kcal100: Double, val unitNam
 /** Intensity values are gross MET. */
 data class Sport(val id: Long, val name: String, val light: Double, val medium: Double, val hard: Double)
 
-data class Meal(val id: Long, val name: String, val grams: Double, val kcal: Double, val minute: Int)
+data class Meal(val id: Long, val name: String, val grams: Double, val kcal: Double, val minute: Int) {
+    /** Direct calorie entries have no quantity; SQLite stores them with a zero-gram sentinel. */
+    val isDirect: Boolean get() = grams == 0.0
+}
 
 data class ActivityEntry(
     val id: Long,
@@ -59,6 +62,69 @@ class TrackerStore(context: Context) : Closeable {
     private val helper = TrackerOpenHelper(context.applicationContext)
 
     override fun close() = helper.close()
+
+    /** A single SQLite transaction captures all tables, including committed WAL contents. */
+    internal fun backupSnapshot(): BackupData {
+        val db = helper.writableDatabase
+        check(db.version == 2) { "Unsupported database version" }
+        val tables = linkedMapOf<String, List<Map<String, Any?>>>()
+        var count = 0
+        var textChars = 0L
+        db.transaction {
+            for ((table, columns) in BACKUP_TABLES) {
+                val rows = mutableListOf<Map<String, Any?>>()
+                rawQuery("SELECT ${columns.joinToString(", ")} FROM $table", null).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        require(++count <= BackupValidation.MAX_ROWS) { "Backup too large" }
+                        val row = linkedMapOf<String, Any?>()
+                        columns.forEachIndexed { index, column ->
+                            val value: Any? = when (cursor.getType(index)) {
+                                Cursor.FIELD_TYPE_NULL -> null
+                                Cursor.FIELD_TYPE_INTEGER -> cursor.getLong(index)
+                                Cursor.FIELD_TYPE_FLOAT -> cursor.getDouble(index)
+                                Cursor.FIELD_TYPE_STRING -> cursor.getString(index)
+                                else -> error("Unsupported database value")
+                            }
+                            // This is a lower bound on encoded size, avoiding rejection of
+                            // valid text merely because JSON escaping might be needed.
+                            if (value is String) textChars += value.length.toLong()
+                            require(textChars <= BackupJson.MAX_BYTES) { "Backup too large" }
+                            row[column] = value
+                        }
+                        rows.add(row)
+                    }
+                }
+                tables[table] = rows
+            }
+        }
+        // REAL affinity may store integral numbers internally as INTEGER; convert only known REAL columns.
+        val normalized = tables.mapValues { (_, rows) -> rows.map { row ->
+            row.mapValues { (column, value) -> if (column in BACKUP_REAL_COLUMNS && value is Long) value.toDouble() else value }
+        } }
+        return BackupValidation.validate(BackupData(BackupValidation.VERSION, normalized))
+    }
+
+    /** Validates again before a single all-or-nothing replacement. */
+    internal fun restoreBackup(input: BackupData) {
+        val data = BackupValidation.validate(input)
+        val db = helper.writableDatabase
+        check(db.version == 2) { "Unsupported database version" }
+        db.transaction {
+            // Delete children before parents; insert parents before children. All names are hard-coded.
+            for (table in BACKUP_TABLES.keys.reversed()) delete(table, null, null)
+            for ((table, columns) in BACKUP_TABLES) {
+                val sql = "INSERT INTO $table (${columns.joinToString(", ")}) VALUES (${columns.joinToString(", ") { "?" }})"
+                for (row in data.tables.getValue(table)) execSQL(sql, columns.map { row[it] }.toTypedArray())
+            }
+            // Deleting rows does not reset AUTOINCREMENT. Reset even for empty tables so a
+            // previously exhausted sequence cannot poison an otherwise valid restore.
+            for (table in listOf("meal", "activity")) {
+                execSQL("DELETE FROM sqlite_sequence WHERE name = ?", arrayOf(table))
+                execSQL("INSERT INTO sqlite_sequence(name, seq) SELECT ?, COALESCE(MAX(id), 0) FROM $table", arrayOf(table))
+            }
+            rawQuery("PRAGMA foreign_key_check", null).use { require(!it.moveToFirst()) { "Invalid backup references" } }
+        }
+    }
 
     fun foods(): List<Food> = helper.readableDatabase.rows(
         "SELECT id, name, kcal100, unit_name, unit_grams FROM food ORDER BY name COLLATE NOCASE, id",
@@ -120,6 +186,36 @@ class TrackerStore(context: Context) : Closeable {
             "INSERT INTO meal(day, name, grams, kcal, minute) VALUES (?, ?, ?, ?, ?)",
             arrayOf<Any?>(day.toEpochDay(), name.trim(), grams, kcal, minute),
         )
+    }
+
+    /** Zero grams denotes a direct kcal entry, not a food quantity. */
+    fun addDirectMeal(day: LocalDate, name: String, kcal: Double, minute: Int) {
+        require(name.isNotBlank() && kcal.isNonNegative() && minute in 0..1439)
+        helper.writableDatabase.execSQL(
+            "INSERT INTO meal(day, name, grams, kcal, minute) VALUES (?, ?, ?, ?, ?)",
+            arrayOf<Any?>(day.toEpochDay(), name.trim(), 0.0, kcal, minute),
+        )
+    }
+
+    /** Update only the recorded kcal while keeping date, time and name unchanged. */
+    fun updateDirectMeal(meal: Meal, kcal: Double): Boolean {
+        require(meal.isDirect && meal.kcal.isNonNegative() && kcal.isNonNegative())
+        val values = ContentValues().apply { put("kcal", kcal) }
+        return helper.writableDatabase.update("meal", values, "id = ? AND grams = ? AND kcal = ?",
+            arrayOf(meal.id.toString(), "0.0", meal.kcal.toString())) > 0
+    }
+
+    /** Atomically store a confirmed scanned food and meal; same-name catalog items stay unchanged. */
+    fun addScannedMeal(day: LocalDate, name: String, kcal100: Double, unitName: String?, unitGrams: Double?, grams: Double, minute: Int) {
+        validateFood(name, kcal100, unitName, unitGrams)
+        val kcal = kcal100 * (grams / 100.0)
+        require(grams.isPositive() && kcal.isNonNegative() && minute in 0..1439)
+        helper.writableDatabase.transaction {
+            val exists = rows("SELECT name FROM food") { getString(0) }.any { it.trim().equals(name.trim(), ignoreCase = true) }
+            if (!exists) execSQL(INSERT_FOOD, arrayOf<Any?>(name.trim(), kcal100, unitName?.trim()?.ifBlank { null }, unitGrams))
+            execSQL("INSERT INTO meal(day, name, grams, kcal, minute) VALUES (?, ?, ?, ?, ?)",
+                arrayOf<Any?>(day.toEpochDay(), name.trim(), grams, kcal, minute))
+        }
     }
 
     /** Keep the recorded energy density even if the catalog entry has changed or was deleted. */
@@ -276,6 +372,19 @@ class TrackerStore(context: Context) : Closeable {
         helper.writableDatabase.delete("activity", "id = ?", arrayOf(id.toString()))
     }
 }
+
+// Static identifiers only: backup contents never become SQL identifiers.
+private val BACKUP_TABLES = linkedMapOf(
+    "food" to listOf("id", "name", "kcal100", "unit_name", "unit_grams"),
+    "sport" to listOf("id", "name", "light", "medium", "hard"),
+    "meal" to listOf("id", "day", "name", "grams", "kcal", "minute"),
+    "activity" to listOf("id", "day", "name", "minutes", "kcal", "minute"),
+    "body" to listOf("day", "weight", "waist", "hip"),
+    "profile" to listOf("day", "age", "height", "formula_offset", "manual", "use_garmin", "garmin_total_is_resting"),
+    "garmin_day" to listOf("day", "total", "active"),
+    "garmin_activity" to listOf("day", "position", "entry_id", "name", "minutes", "kcal", "minute", "source"),
+)
+private val BACKUP_REAL_COLUMNS = setOf("kcal100", "unit_grams", "light", "medium", "hard", "grams", "kcal", "weight", "waist", "hip", "height", "manual", "total", "active")
 
 private const val DAY_RANGE = "day BETWEEN ? AND ?"
 private const val BODY_COLUMNS = "day, weight, waist, hip"

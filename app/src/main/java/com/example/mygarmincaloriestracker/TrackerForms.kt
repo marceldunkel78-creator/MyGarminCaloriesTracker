@@ -32,10 +32,16 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 internal class TrackerForms(private val context: Context) {
-    fun meal(foods: List<Food>, onSave: (Food, Double) -> Unit, onNew: () -> Unit) {
+    fun meal(foods: List<Food>, onSave: (Food, Double) -> Unit, onNew: () -> Unit, onScan: () -> Unit, onDirect: () -> Unit) {
         val form = Form()
         var selected: Food? = null
         val pick = form.button("Lebensmittel auswählen")
+        val scan = form.button("Barcode scannen").apply {
+            icon = androidx.appcompat.content.res.AppCompatResources.getDrawable(context, R.drawable.ic_barcode_tracker)
+            iconGravity = MaterialButton.ICON_GRAVITY_TEXT_START
+            contentDescription = "Barcode scannen und Produkt suchen"
+        }
+        val direct = form.button("Kalorien direkt eingeben")
         val selectionError = form.errorNote()
         val detail = form.note()
         val byPortion = form.checkbox("In Portionen eingeben")
@@ -87,7 +93,16 @@ internal class TrackerForms(private val context: Context) {
         detail.show(null)
         update()
 
-        form.dialog("Mahlzeit erfassen", "Neues Lebensmittel" to onNew) submit@{ dialog ->
+        var scanDialog: AlertDialog? = null
+        scan.setOnClickListener {
+            scanDialog?.dismiss()
+            onScan()
+        }
+        direct.setOnClickListener {
+            scanDialog?.dismiss()
+            onDirect()
+        }
+        scanDialog = form.dialog("Mahlzeit erfassen", "Neues Lebensmittel" to onNew) submit@{ dialog ->
             val food = selected ?: return@submit selectionError.report("Wähle ein Lebensmittel aus.")
             val field = if (byPortion.isChecked) portions else grams
             if (field.number() == null) return@submit field.invalid("Gib eine Menge größer als 0 ein.")
@@ -98,6 +113,114 @@ internal class TrackerForms(private val context: Context) {
             dialog.dismiss()
             onSave(food, amount)
         }
+    }
+
+    fun directMeal(day: LocalDate, onSave: (String, Double, (Result<Boolean>) -> Unit) -> Unit, onSaved: () -> Unit, onCancel: () -> Unit) {
+        val form = Form()
+        val date = day.format(DateTimeFormatter.ofLocalizedDate(FormatStyle.LONG).withLocale(Locale.GERMANY))
+        form.note("$date · Kalorien direkt erfassen, ohne Lebensmittel oder Grammangabe.")
+        val name = form.input("Bezeichnung (optional)", Kind.TEXT)
+        val kcal = form.input("Kalorien (kcal)", Kind.DECIMAL)
+        val error = form.errorNote()
+        val dialog = form.dialog("Kalorien direkt eintragen") submit@{ dialog ->
+            val energy = kcal.number(allowZero = true) ?: return@submit kcal.invalid("Gib einen Kalorienwert ab 0 ein.")
+            val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            val negative = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+            positive.isEnabled = false
+            negative.isEnabled = false
+            dialog.setCancelable(false)
+            error.show(null)
+            onSave(name.value.ifBlank { "Kalorienaufnahme" }, energy) { result ->
+                if (!dialog.isShowing) return@onSave
+                positive.isEnabled = true
+                negative.isEnabled = true
+                dialog.setCancelable(true)
+                result.fold(onSuccess = { saved ->
+                    if (saved) { dialog.dismiss(); onSaved() }
+                    else error.show("Der Eintrag konnte nicht gespeichert werden.")
+                }, onFailure = { error.show("Der Eintrag konnte nicht gespeichert werden. Bitte versuche es erneut.") })
+            }
+        }
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener { dialog.dismiss(); onCancel() }
+        dialog.setOnCancelListener { onCancel() }
+    }
+
+    fun editDirectMeal(meal: Meal, onMealUpdated: () -> Unit, save: (Double, (Result<Boolean>) -> Unit) -> Unit) {
+        val form = Form()
+        form.note("${meal.name} · Kalorienaufnahme direkt bearbeiten")
+        val kcal = form.input("Kalorien (kcal)", Kind.DECIMAL, meal.kcal.asInput())
+        val error = form.errorNote()
+        form.dialog("Kalorien bearbeiten") submit@{ dialog ->
+            val energy = kcal.number(allowZero = true) ?: return@submit kcal.invalid("Gib einen Kalorienwert ab 0 ein.")
+            val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            val negative = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+            positive.isEnabled = false
+            negative.isEnabled = false
+            dialog.setCancelable(false)
+            error.show(null)
+            save(energy) { result ->
+                if (!dialog.isShowing) return@save
+                positive.isEnabled = true
+                negative.isEnabled = true
+                dialog.setCancelable(true)
+                result.fold(onSuccess = { updated ->
+                    if (updated) { dialog.dismiss(); onMealUpdated() }
+                    else error.show("Der Eintrag wurde zwischenzeitlich geändert oder gelöscht. Bitte schließe den Dialog und versuche es erneut.")
+                }, onFailure = { error.show("Die Änderung konnte nicht gespeichert werden. Bitte versuche es erneut.") })
+            }
+        }
+    }
+
+    fun scannedProduct(product: Product, onSave: (String, Double, String?, Double?, Double?, (Result<Boolean>) -> Unit) -> Unit, onSaved: () -> Unit, onCancel: () -> Unit) {
+        val form = Form()
+        form.note("Quelle: Open Food Facts. Bitte überprüfe die Angaben auf der Verpackung; Daten können unvollständig oder falsch sein.")
+        val name = form.input("Produktname", Kind.TEXT, product.name)
+        val brand = form.input("Marke (optional)", Kind.TEXT, product.brand.orEmpty())
+        val kcal = form.input("Energie (kcal pro 100 g)", Kind.DECIMAL, product.kcalPer100.asInput())
+        val portion = form.input("Portionsgewicht (g, optional)", Kind.DECIMAL, product.servingGrams.asInput())
+        if (product.servingLabel != null && product.servingGrams == null) form.note("Originale Portionsangabe: ${product.servingLabel}. Bitte ein Gewicht in Gramm eintragen, falls bekannt.")
+        val logMeal = form.checkbox("Auch als Mahlzeit eintragen").apply { isChecked = true }
+        val amount = form.input("Menge der Mahlzeit (g)", Kind.DECIMAL, product.servingGrams.asInput())
+        val preview = form.note()
+        val error = form.errorNote()
+        fun update() {
+            val energy = kcal.number(allowZero = true)
+            val grams = amount.number()
+            amount.box.visibility = if (logMeal.isChecked) View.VISIBLE else View.GONE
+            preview.show(if (logMeal.isChecked && energy != null && grams != null) mealKcal(energy, grams)?.let { "${format(it)} kcal" } else null)
+        }
+        logMeal.setOnCheckedChangeListener { _, _ -> update() }
+        kcal.onChange(::update)
+        amount.onChange(::update)
+        update()
+        val dialog = form.dialog("Gescanntes Produkt prüfen") submit@{ dialog ->
+            if (name.value.isBlank()) return@submit name.invalid("Gib einen Produktnamen ein.")
+            val energy = kcal.number(allowZero = true) ?: return@submit kcal.invalid("Gib kcal pro 100 g ab 0 ein.")
+            val unitGrams = portion.number()
+            if (portion.value.isNotEmpty() && unitGrams == null) return@submit portion.invalid("Gib ein Portionsgewicht größer als 0 ein.")
+            val grams = if (logMeal.isChecked) amount.number() ?: return@submit amount.invalid("Gib eine Menge größer als 0 ein.") else null
+            if ((grams != null && mealKcal(energy, grams) == null) || (unitGrams != null && mealKcal(energy, unitGrams) == null))
+                return@submit amount.invalid("Die Kalorien lassen sich für diese Menge nicht berechnen.")
+            val fullName = listOf(name.value, brand.value).filter { it.isNotBlank() }.joinToString(" · ")
+            val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            val negative = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+            positive.isEnabled = false
+            negative.isEnabled = false
+            dialog.setCancelable(false)
+            error.show(null)
+            onSave(fullName, energy, unitGrams?.let { "Portion" }, unitGrams, grams) { result ->
+                if (!dialog.isShowing) return@onSave
+                positive.isEnabled = true
+                negative.isEnabled = true
+                dialog.setCancelable(true)
+                result.fold(onSuccess = { saved ->
+                    if (saved) { dialog.dismiss(); onSaved() }
+                    else error.show("Produkt konnte nicht gespeichert werden.")
+                }, onFailure = { failure -> error.show(if (failure is DuplicateCatalogNameException) "Dieser Produktname ist bereits im Katalog vorhanden." else "Die Daten konnten nicht gespeichert werden. Bitte versuche es erneut.") })
+            }
+        }
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener { dialog.dismiss(); onCancel() }
+        dialog.setOnCancelListener { onCancel() }
     }
 
     fun editMealAmount(meal: Meal, onMealUpdated: () -> Unit, save: (Double, (Result<Boolean>) -> Unit) -> Unit) {
@@ -291,6 +414,8 @@ internal class TrackerForms(private val context: Context) {
         onPermissions: () -> Unit,
         onSync: () -> Unit,
         onClear: () -> Unit,
+        onExport: () -> Unit,
+        onImport: () -> Unit,
     ): View {
         val form = Form()
         form.note("Kalorienverbrauch", heading = true)
@@ -339,7 +464,7 @@ internal class TrackerForms(private val context: Context) {
 
         form.note("Garmin & Health Connect", heading = true)
         form.note("Kein API-Schlüssel nötig. Ab Android 14 kannst du in Garmin Connect die Freigabe an Health Connect aktivieren. Welche Tageswerte und Aktivitäten importiert werden können, hängt davon ab, welche Daten Garmin Connect bereitstellt.")
-        form.note("Wenn ein Garmin-Gesamtwert verwendet wird, rechnet die App keine separat erfassten Workouts hinzu.")
+        form.note("Wenn ein Garmin-Gesamtwert verwendet wird, rechnet die App keine separat erfassten Workouts hinzu. Ist der Garmin-Tageswert ausgeschaltet, zählen ausschließlich manuell erfasste Aktivitäten; bereits importierte Garmin-Aktivitäten bleiben nur zur Ansicht und werden nicht automatisch aktualisiert.")
         if (!garminAvailable) form.note("Health Connect ist für den Garmin-Import auf diesem Gerät derzeit nicht verfügbar.")
         form.note("Erlaube der App den Lesezugriff in Health Connect. Synchronisiere den gewünschten Tag zuerst in Garmin Connect und importiere dann den im Tracker ausgewählten Tag. Diese Aktionen speichern keine Einstellungen.")
         form.button("Health-Connect-Zugriff verwalten", onPermissions).isEnabled = garminAvailable
@@ -352,6 +477,10 @@ internal class TrackerForms(private val context: Context) {
                 .setPositiveButton("Löschen") { _, _ -> onClear() }
                 .show()
         }
+        form.note("Lokale Sicherung", heading = true)
+        form.note("Die JSON-Datei enthält private Gesundheitsdaten und Einstellungen. Wähle einen geschützten Speicherort; Cloud-Speicher kann die Datei hochladen. Exportiere am besten vor jeder Wiederherstellung eine neue Sicherung.")
+        form.button("Sicherung exportieren", onExport)
+        form.button("Sicherung importieren", onImport)
         return form.scroll()
     }
 
@@ -480,7 +609,7 @@ internal class TrackerForms(private val context: Context) {
             addView(column, FrameLayout.LayoutParams(-1, -2))
         }
 
-        fun dialog(title: String, extra: Pair<String, () -> Unit>? = null, onSubmit: (AlertDialog) -> Unit) {
+        fun dialog(title: String, extra: Pair<String, () -> Unit>? = null, onSubmit: (AlertDialog) -> Unit): AlertDialog {
             val builder = MaterialAlertDialogBuilder(context)
                 .setTitle(title)
                 .setView(scroll())
@@ -495,6 +624,7 @@ internal class TrackerForms(private val context: Context) {
             val dialog = builder.create()
             dialog.showWithResize()
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { onSubmit(dialog) }
+            return dialog
         }
     }
 

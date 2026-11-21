@@ -1,17 +1,21 @@
 package com.example.mygarmincaloriestracker
 
 import android.content.Context
+import android.content.res.ColorStateList
 import android.text.InputType
 import android.text.method.DigitsKeyListener
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import androidx.appcompat.app.AlertDialog
 import androidx.core.widget.doAfterTextChanged
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
@@ -207,16 +211,35 @@ internal class TrackerCatalog(private val context: Context) {
             if (error) column.addView(button("Erneut versuchen", reload))
         }
         fun item(name: String, detail: String, edit: () -> Unit, delete: () -> Unit) {
-            column.addView(MaterialTextView(context).apply {
-                text = name
-                setTextAppearance(com.google.android.material.R.style.TextAppearance_MaterialComponents_Subtitle1)
-                setPadding(0, dp(16), 0, 0)
-            })
-            note(detail)
-            val actions = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-            actions.addView(button("Bearbeiten", edit).apply { contentDescription = "$name bearbeiten" }, LinearLayout.LayoutParams(0, -2, 1f))
-            actions.addView(button("Löschen", delete).apply { contentDescription = "$name löschen" }, LinearLayout.LayoutParams(0, -2, 1f))
-            column.addView(actions)
+            val row = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val textColumn = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(MaterialTextView(context).apply {
+                    text = name
+                    setTextAppearance(com.google.android.material.R.style.TextAppearance_MaterialComponents_Subtitle1)
+                }, LinearLayout.LayoutParams(-1, -2))
+                addView(MaterialTextView(context).apply {
+                    text = detail
+                    setPadding(0, dp(8), 0, dp(8))
+                }, LinearLayout.LayoutParams(-1, -2))
+            }
+            row.addView(textColumn, LinearLayout.LayoutParams(0, -2, 1f))
+            fun iconAction(icon: Int, description: String, action: () -> Unit) = ImageButton(context).apply {
+                setImageResource(icon)
+                imageTintList = ColorStateList.valueOf(MaterialColors.getColor(this, com.google.android.material.R.attr.colorPrimary))
+                setBackgroundResource(android.R.drawable.list_selector_background)
+                contentDescription = description
+                minimumWidth = dp(48)
+                minimumHeight = dp(48)
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+                setOnClickListener { action() }
+            }
+            row.addView(iconAction(R.drawable.ic_edit_tracker, "$name bearbeiten", edit), LinearLayout.LayoutParams(dp(48), dp(48)))
+            row.addView(iconAction(R.drawable.ic_delete_tracker, "$name löschen", delete), LinearLayout.LayoutParams(dp(48), dp(48)))
+            column.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
         }
         private fun button(label: String, action: () -> Unit) = MaterialButton(context, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
             text = label; setOnClickListener { action() }

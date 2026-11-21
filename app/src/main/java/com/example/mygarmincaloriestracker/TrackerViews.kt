@@ -5,8 +5,10 @@ import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.DashPathEffect
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -19,6 +21,7 @@ import android.widget.TextView
 import androidx.annotation.RequiresApi
 import androidx.core.graphics.ColorUtils
 import androidx.core.view.ViewCompat
+import androidx.core.view.doOnLayout
 import com.google.android.material.R as MaterialR
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.MaterialColors
@@ -51,6 +54,8 @@ internal enum class StatsPeriod(val label: String) {
         YEAR -> anchor.plusYears(step.toLong())
     }
 }
+
+internal enum class StatsTarget { ENERGY, CHANGE, BODY }
 
 /** Most recent actual measurement for each metric, with its own measurement date. */
 internal data class LatestMeasurements(
@@ -91,6 +96,7 @@ internal class TrackerViews(private val context: Context) {
         onSettings: () -> Unit,
         streak: Int = 0,
         measurements: LatestMeasurements? = null,
+        onStatistics: (StatsTarget) -> Unit,
         onEditMeal: (Meal) -> Unit,
     ): View = screen(bottom = 104) {
         val cutoffDate = minOf(data.day, now.toLocalDate())
@@ -127,13 +133,15 @@ internal class TrackerViews(private val context: Context) {
             } else if (energy.source == "Garmin" && energy.burned != null) {
                 addView(label("Keine verlässliche Aufteilung verfügbar.", 13, muted), margins(top = 5))
             }
-        }
+        }.statisticsLink("Energieverlauf") { onStatistics(StatsTarget.ENERGY) }
         card("Geschätzte Gewichtsänderung", tinted = true) {
-            val change = energy.changeKg
+            val change = energy.changeKg?.takeIf { it.isFinite() && (it * 1000).isFinite() }
             if (change != null) {
                 val (arrow, word, shade) = direction(change)
-                val estimate = if (change != 0.0 && kotlin.math.abs(change) < 0.005) "unter 0,01 kg"
-                    else quantity(change, "kg", 2, signed = true)
+                val grams = change * 1000
+                val estimate = if (grams != 0.0 && kotlin.math.abs(grams) < 0.1) {
+                    "${if (grams > 0) "+" else "−"}< 0,1 g"
+                } else quantity(grams, "g", 1, signed = true)
                 addView(label("$arrow $estimate", 32, shade, bold = true), margins(top = 8))
                 addView(label("$word · Energiebilanz ${quantity(energy.balance, "kcal", signed = true)}", 15, shade, bold = true), margins(top = 4))
             } else {
@@ -141,15 +149,31 @@ internal class TrackerViews(private val context: Context) {
                 addView(label("Dafür werden erfasste Mahlzeiten und Verbrauchsdaten benötigt.", 14, muted), margins(top = 4))
             }
             addView(label("Grober Richtwert aus der Energiebilanz, kein gemessenes Gewicht.", 13, muted), margins(top = 10))
-        }
+        }.statisticsLink("Verlauf der geschätzten Gewichtsänderung") { onStatistics(StatsTarget.CHANGE) }
         card("Körpermaße") {
             metric("Gewicht", weight?.second, "kg", weight?.first)
             metric("Taille", waist?.second, "cm", waist?.first)
             metric("Hüfte", hip?.second, "cm", hip?.first)
+            val height = data.profile.height?.takeIf { it.isFinite() && it > 0 }
+            val meters = height?.div(100.0)
+            val bmi = if (weight != null && meters != null) {
+                (weight.second / (meters * meters)).takeIf { it.isFinite() && it > 0 }
+            } else null
+            if (bmi != null) {
+                addView(label("BMI: ${quantity(bmi, "", 1).trimEnd()} (Größe ${quantity(height, "cm", 1)})", 14, muted), margins(top = 8))
+            } else {
+                val hint = when {
+                    height == null && weight == null -> "Für den BMI Gewicht erfassen und Größe in den Einstellungen hinterlegen."
+                    height == null -> "Für den BMI Größe in den Einstellungen hinterlegen."
+                    weight == null -> "Für den BMI Gewicht erfassen."
+                    else -> "BMI mit den vorhandenen Werten nicht verfügbar."
+                }
+                addView(label(hint, 13, muted), margins(top = 8))
+            }
             if (weight == null && waist == null && hip == null) {
                 addView(label("Trage über + deine erste Messung ein.", 14, muted), margins(top = 10))
             }
-        }
+        }.statisticsLink("Verlauf der Körpermaße") { onStatistics(StatsTarget.BODY) }
         card("Prognose und Erfolge", tinted = true) {
             val isToday = data.day == now.toLocalDate()
             addView(label("Quelle: ${energy.source}", 15, bold = true), margins(top = 8))
@@ -210,9 +234,11 @@ internal class TrackerViews(private val context: Context) {
                 empty("Noch keine Mahlzeiten", "Tippe auf +, um etwas zu erfassen.")
             } else {
                 data.meals.sortedBy { it.minute }.forEach { meal ->
-                    entry(meal.name, "${time(meal.minute)} · ${quantity(meal.grams, "g", 1)} · ${quantity(meal.kcal, "kcal")}",
+                    val detail = listOfNotNull(time(meal.minute),
+                        if (meal.isDirect) null else quantity(meal.grams, "g", 1), quantity(meal.kcal, "kcal")).joinToString(" · ")
+                    entry(meal.name, detail,
                         deleteLabel = "Mahlzeit ${meal.name} löschen", delete = { onDeleteMeal(meal.id) },
-                        editLabel = "Menge von ${meal.name} bearbeiten", edit = { onEditMeal(meal) })
+                        editLabel = if (meal.isDirect) "Kalorien von ${meal.name} bearbeiten" else "Menge von ${meal.name} bearbeiten", edit = { onEditMeal(meal) })
                 }
             }
         }
@@ -246,6 +272,7 @@ internal class TrackerViews(private val context: Context) {
         anchor: LocalDate,
         onPeriod: (StatsPeriod) -> Unit,
         onStep: (Int) -> Unit,
+        target: StatsTarget? = null,
     ): View = screen(bottom = 24) {
         val (from, to) = period.range(anchor)
         val today = now.toLocalDate()
@@ -309,7 +336,7 @@ internal class TrackerViews(private val context: Context) {
         card("Energieverlauf") {
             addView(label("● Aufnahme  ·  ■ Verbrauch", 14, muted), margins(top = 8))
             graph(listOf(series(0), series(1)), ticks, from, yearly, includeZero = true)
-        }
+        }.tag = StatsTarget.ENERGY
         if (period == StatsPeriod.DAY) {
             val mealsByHour = arrayOfNulls<Sample>(24)
             val cutoff = if (from == today) now.hour * 60 + now.minute else 1439
@@ -330,10 +357,21 @@ internal class TrackerViews(private val context: Context) {
         card("Geschätzte Gewichtsänderung") {
             addView(label("↑ Zunahme · ↓ Abnahme · aus der Energiebilanz, keine Messung", 14, muted), margins(top = 8))
             graph(listOf(series(2)), ticks, from, yearly, includeZero = true, highlightZero = true)
-        }
+        }.tag = StatsTarget.CHANGE
         addView(title("Gemessene Körpermaße", 20), margins(top = 22))
         (3..5).forEach { index ->
             card(metrics[index].name) { graph(listOf(series(index)), ticks, from, yearly, includeZero = false, connectGaps = true) }
+                .apply { if (index == 3) tag = StatsTarget.BODY }
+        }
+    }.apply {
+        if (target != null) doOnLayout {
+            post {
+                findViewWithTag<View>(target)?.let { destination ->
+                    val bounds = Rect(0, 0, destination.width, destination.height)
+                    offsetDescendantRectToMyCoords(destination, bounds)
+                    scrollTo(0, bounds.top)
+                }
+            }
         }
     }
 
@@ -524,13 +562,34 @@ internal class TrackerViews(private val context: Context) {
         }, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
     }
 
-    private fun LinearLayout.card(name: String, tinted: Boolean = false, content: LinearLayout.() -> Unit) {
-        addView(column().apply {
+    private fun LinearLayout.card(name: String, tinted: Boolean = false, content: LinearLayout.() -> Unit): LinearLayout {
+        val card = column().apply {
             background = rounded(if (tinted) tint else surface, 18, outline)
             setPadding(dp(16), dp(14), dp(16), dp(14))
             addView(title(name, 19))
             content()
-        }, margins(top = 12))
+        }
+        addView(card, margins(top = 12))
+        return card
+    }
+
+    private fun LinearLayout.statisticsLink(destination: String, click: () -> Unit) {
+        fun accessibleText(view: View): List<String> = when (view) {
+            is TextView -> listOf(view.text.toString())
+            is android.view.ViewGroup -> (0 until view.childCount).flatMap { accessibleText(view.getChildAt(it)) }
+            else -> emptyList()
+        }
+        contentDescription = (accessibleText(this) + "Öffnet $destination in der Statistik").joinToString(". ")
+        minimumHeight = dp(48)
+        isFocusable = true
+        background = RippleDrawable(ColorStateList.valueOf(ColorUtils.setAlphaComponent(primary, 38)), background, null)
+        ViewCompat.setAccessibilityDelegate(this, object : androidx.core.view.AccessibilityDelegateCompat() {
+            override fun onInitializeAccessibilityNodeInfo(host: View, info: androidx.core.view.accessibility.AccessibilityNodeInfoCompat) {
+                super.onInitializeAccessibilityNodeInfo(host, info)
+                info.className = android.widget.Button::class.java.name
+            }
+        })
+        setOnClickListener { click() }
     }
 
     private data class BurnPart(val name: String, val kcal: Double, val color: Int)
