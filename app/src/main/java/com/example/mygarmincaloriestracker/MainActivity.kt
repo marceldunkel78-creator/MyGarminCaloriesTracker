@@ -9,6 +9,8 @@ import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
+import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -20,9 +22,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.children
-import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.repeatOnLifecycle
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -36,17 +37,22 @@ import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
-    private enum class Page { DAY, STATISTICS, SETTINGS }
+    private enum class Page { DAY, STATISTICS, SETTINGS, FOODS, SPORTS }
 
     private val store by lazy { TrackerStore(applicationContext) }
     private val garmin by lazy { GarminHealth(applicationContext) }
     private val forms by lazy { TrackerForms(this) }
     private val views by lazy { TrackerViews(this) }
+    private val catalog by lazy { TrackerCatalog(this) }
+    private var refreshLayout: SwipeRefreshLayout? = null
+    private var startX = 0f
+    private var startY = 0f
+    private var swipeEligible = false
+    private var syncFromRefresh = false
     private lateinit var toolbar: MaterialToolbar
     private lateinit var host: FrameLayout
     private lateinit var add: FloatingActionButton
@@ -58,8 +64,6 @@ class MainActivity : AppCompatActivity() {
     private var syncJob: Job? = null
     private var saving = false
     private var syncAfterPermission = false
-    private var lastAutoSyncAt = 0L
-    private var lastAutoSyncDay: LocalDate? = null
 
     private val healthPermissions = registerForActivityResult(GarminHealth.permissionContract()) { granted ->
         val import = syncAfterPermission
@@ -69,8 +73,7 @@ class MainActivity : AppCompatActivity() {
         } else if (import) {
             sync(manual = true)
         } else {
-            toast("Health-Connect-Zugriff aktualisiert.")
-            if (page == Page.DAY) sync()
+            toast("Health-Connect-Zugriff aktualisiert. Ziehe die Übersicht zum Aktualisieren nach unten.")
         }
     }
 
@@ -115,19 +118,6 @@ class MainActivity : AppCompatActivity() {
             }
         })
         open(page)
-        lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.RESUMED) {
-                var firstPass = true
-                while (true) {
-                    if (page == Page.DAY && !saving) {
-                        render(preserveScroll = true)
-                        sync(force = firstPass)
-                    }
-                    firstPass = false
-                    delay(60_000)
-                }
-            }
-        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -143,9 +133,11 @@ class MainActivity : AppCompatActivity() {
         page = next
         if (resetAnchor) anchor = day
         toolbar.title = when (page) {
-            Page.DAY -> "Kalorien & Maße"
+            Page.DAY -> "MyGarmin Calorie Tracker"
             Page.STATISTICS -> "Statistik"
             Page.SETTINGS -> "Einstellungen"
+            Page.FOODS -> "Lebensmittel-Datenbank"
+            Page.SPORTS -> "Aktivitäten-Datenbank"
         }
         toolbar.menu.clear()
         toolbar.navigationIcon = if (page == Page.DAY) null else getDrawable(R.drawable.ic_back_tracker)
@@ -158,12 +150,15 @@ class MainActivity : AppCompatActivity() {
                 setOnMenuItemClickListener { chooseDay(); true }
             }
             toolbar.menu.add("Statistik").setOnMenuItemClickListener { open(Page.STATISTICS, true); true }
+            toolbar.menu.add("Lebensmittel-Datenbank").setOnMenuItemClickListener { open(Page.FOODS); true }
+            toolbar.menu.add("Aktivitäten-Datenbank").setOnMenuItemClickListener { open(Page.SPORTS); true }
+            toolbar.menu.add("Vorheriger Tag").setOnMenuItemClickListener { changeDay(-1); true }
+            toolbar.menu.add("Nächster Tag").setOnMenuItemClickListener { changeDay(1); true }
             toolbar.menu.add("Einstellungen").setOnMenuItemClickListener { open(Page.SETTINGS); true }
             toolbar.menu.add("Garmin aktualisieren").setOnMenuItemClickListener { sync(manual = true); true }
         }
         add.visibility = if (page == Page.DAY) View.VISIBLE else View.GONE
         render()
-        if (page == Page.DAY) sync()
     }
 
     private fun render(preserveScroll: Boolean = false) {
@@ -172,18 +167,32 @@ class MainActivity : AppCompatActivity() {
         val date = day
         val selectedPeriod = period
         val statsDay = anchor
-        val scrollY = if (preserveScroll) host.children.filterIsInstance<ScrollView>().firstOrNull()?.scrollY ?: 0 else 0
+        val currentContent = host.children.firstOrNull { it !== add }
+        val currentScroll = if (currentContent is SwipeRefreshLayout) currentContent.getChildAt(0) as? ScrollView else currentContent as? ScrollView
+        val scrollY = if (preserveScroll) currentScroll?.scrollY ?: 0 else 0
         if (!preserveScroll) replaceContent(ProgressBar(this), centered = true)
         renderJob = lifecycleScope.launch {
             try {
                 val now = LocalDateTime.now()
                 val view = when (requested) {
                     Page.DAY -> {
-                        val data = withContext(Dispatchers.IO) { store.day(date) }
-                        views.dashboard(data, now,
+                        val (data, measurements, streak) = withContext(Dispatchers.IO) {
+                            Triple(store.day(date), store.latestMeasurements(date), store.deficitStreak(date, now))
+                        }
+                        val content = views.dashboard(data, now,
                             onDeleteMeal = { id -> confirmDelete("Mahlzeit") { store.deleteMeal(id) } },
                             onDeleteActivity = { id -> confirmDelete("Aktivität") { store.deleteActivity(id) } },
-                            onSettings = { open(Page.SETTINGS) })
+                            onSettings = { open(Page.SETTINGS) }, streak = streak, measurements = measurements,
+                            onEditMeal = { meal ->
+                                forms.editMealAmount(meal, onMealUpdated = { render(preserveScroll = true) }) { grams, done ->
+                                    catalogWrite(done) { store.updateMealAmount(meal, grams) }
+                                }
+                            })
+                        SwipeRefreshLayout(this@MainActivity).apply {
+                            addView(content)
+                            setOnRefreshListener { sync(manual = true, fromRefresh = true) }
+                            isRefreshing = syncFromRefresh
+                        }
                     }
                     Page.STATISTICS -> {
                         val (from, to) = selectedPeriod.range(statsDay)
@@ -198,6 +207,28 @@ class MainActivity : AppCompatActivity() {
                                 render()
                             }
                         })
+                    }
+                    Page.FOODS -> {
+                        val items = withContext(Dispatchers.IO) { store.foods() }
+                        catalog.foods(items,
+                            onUpdate = { item, done -> catalogWrite(done) { store.updateFood(item) } },
+                            onDelete = { id, done -> catalogWrite(done) { store.deleteFood(id) } },
+                            onReload = { render() },
+                            onAdd = { food, done -> catalogWrite(done) {
+                                store.addFood(food.name, food.kcal100, food.unitName, food.unitGrams)
+                                true
+                            } })
+                    }
+                    Page.SPORTS -> {
+                        val items = withContext(Dispatchers.IO) { store.sports() }
+                        catalog.sports(items,
+                            onUpdate = { item, done -> catalogWrite(done) { store.updateSport(item) } },
+                            onDelete = { id, done -> catalogWrite(done) { store.deleteSport(id) } },
+                            onReload = { render() },
+                            onAdd = { sport, done -> catalogWrite(done) {
+                                store.addSport(sport.name, sport.light, sport.medium, sport.hard)
+                                true
+                            } })
                     }
                     Page.SETTINGS -> {
                         val profile = withContext(Dispatchers.IO) { store.profile() }
@@ -219,7 +250,8 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 replaceContent(view)
-                if (scrollY > 0) view.post { view.scrollTo(0, scrollY) }
+                val scroll = if (view is SwipeRefreshLayout) view.getChildAt(0) else view
+                if (scrollY > 0) scroll.post { scroll.scrollTo(0, scrollY) }
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -235,8 +267,52 @@ class MainActivity : AppCompatActivity() {
 
     private fun replaceContent(view: View, centered: Boolean = false) {
         host.children.toList().filter { it !== add }.forEach { host.removeView(it) }
+        refreshLayout = view as? SwipeRefreshLayout
         host.addView(view, 0, if (centered) FrameLayout.LayoutParams(-2, -2, Gravity.CENTER)
             else FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private fun changeDay(delta: Long) {
+        val candidate = day.plusDays(delta)
+        if (candidate <= LocalDate.now()) {
+            day = candidate
+            open(Page.DAY)
+        }
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (page != Page.DAY) {
+            swipeEligible = false
+            return super.dispatchTouchEvent(event)
+        }
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> { startX = event.x; startY = event.y; swipeEligible = true }
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_CANCEL -> swipeEligible = false
+            MotionEvent.ACTION_UP -> {
+                val dx = event.x - startX
+                val dy = event.y - startY
+                val threshold = maxOf(dp(72), ViewConfiguration.get(this).scaledTouchSlop * 4)
+                if (swipeEligible && kotlin.math.abs(dx) > threshold && kotlin.math.abs(dx) > 1.5f * kotlin.math.abs(dy)) {
+                    swipeEligible = false
+                    val cancelled = MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL }
+                    super.dispatchTouchEvent(cancelled)
+                    cancelled.recycle()
+                    changeDay(if (dx < 0) 1 else -1)
+                    return true
+                }
+                swipeEligible = false
+            }
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
+    private fun catalogWrite(done: (Result<Boolean>) -> Unit, operation: () -> Boolean) {
+        lifecycleScope.launch {
+            val result = try { Result.success(withContext(Dispatchers.IO) { operation() }) }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { Result.failure(e) }
+            done(result)
+        }
     }
 
     private fun chooseDay() {
@@ -359,18 +435,20 @@ class MainActivity : AppCompatActivity() {
             }.show()
     }
 
-    private fun sync(manual: Boolean = false, force: Boolean = false) {
+    private fun sync(manual: Boolean = false, fromRefresh: Boolean = false) {
+        fun stopRefresh() { if (fromRefresh) refreshLayout?.isRefreshing = false }
         if (!garmin.available()) {
             if (manual) toast("Garmin-Import über Health Connect braucht Android 14 oder neuer.")
+            stopRefresh()
             return
         }
         if (syncJob?.isActive == true || saving) {
             if (manual) toast("Bitte warte, bis der aktuelle Vorgang abgeschlossen ist.")
+            stopRefresh()
             return
         }
         val date = day
-        val elapsed = android.os.SystemClock.elapsedRealtime()
-        if (!manual && !force && lastAutoSyncDay == date && elapsed - lastAutoSyncAt < 300_000L) return
+        syncFromRefresh = fromRefresh
         syncJob = lifecycleScope.launch {
             try {
                 val enabled = withContext(Dispatchers.IO) { store.profile().useGarmin }
@@ -379,9 +457,7 @@ class MainActivity : AppCompatActivity() {
                     if (manual) requestPermissionsForGarmin(importAfter = true)
                     return@launch
                 }
-                lastAutoSyncDay = date
-                lastAutoSyncAt = elapsed
-                if (manual) toast("Garmin-Daten werden gelesen …")
+                if (manual && !fromRefresh) toast("Garmin-Daten werden gelesen …")
                 val result = garmin.read(date, includeDetails = manual)
                 val data = result.data
                 val hasData = data.total != null || data.active != null || data.activities.isNotEmpty()
@@ -395,7 +471,9 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 if (page == Page.DAY && day == date && hasData) render(preserveScroll = true)
-                if (manual) {
+                if (fromRefresh) {
+                    toast(if (!hasData) "Keine Garmin-Daten für diesen Tag gefunden." else if (data.total == null) "Aktivitäten importiert; kein vollständiger Garmin-Verbrauch verfügbar." else "Garmin-Daten aktualisiert.")
+                } else if (manual) {
                     val displayDate = date.format(DateTimeFormatter.ofPattern("dd.MM.yyyy", Locale.GERMANY))
                     val format = java.text.NumberFormat.getNumberInstance(Locale.GERMANY).apply { maximumFractionDigits = 1 }
                     fun kcal(value: Double?) = value?.let { "${format.format(it)} kcal" } ?: "nicht verfügbar"
@@ -425,6 +503,9 @@ class MainActivity : AppCompatActivity() {
                 if (manual) toast("Kein Zugriff auf diesen Tag. Prüfe die Berechtigungen und den Health-Connect-Verlauf.")
             } catch (_: Exception) {
                 if (manual) toast("Garmin-Daten konnten nicht gelesen werden.")
+            } finally {
+                syncFromRefresh = false
+                stopRefresh()
             }
         }
     }

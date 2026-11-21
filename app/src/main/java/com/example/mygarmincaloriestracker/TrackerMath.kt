@@ -3,7 +3,7 @@ package com.example.mygarmincaloriestracker
 import androidx.annotation.RequiresApi
 import java.time.LocalDateTime
 
-/** [forecast] is projected end-of-day burn. Positive [balance] and [changeKg] denote a surplus. */
+/** [forecast] is projected end-of-day burn. Positive balances and [changeKg] denote a surplus. */
 data class Energy(
     val intake: Double,
     val burned: Double?,
@@ -14,6 +14,8 @@ data class Energy(
     val resting: Double? = null,
     val active: Double? = null,
     val everyday: Double? = null,
+    /** Recorded intake minus projected end-of-day burn; null when either is unknown. */
+    val projectedBalance: Double? = null,
 )
 
 object TrackerMath {
@@ -29,7 +31,10 @@ object TrackerMath {
 
     /**
      * Entry minutes are local logging/completion times. Today's Garmin totals must be imported
-     * as an elapsed snapshot, not a daily goal. An elapsed Garmin snapshot isn't extrapolated.
+     * as an elapsed snapshot, not a daily goal. For today, resting energy is extrapolated
+     * using the elapsed fraction of the local clock day, and recorded active energy is added
+     * once without extrapolation. Garmin imports have no snapshot timestamp, so this is an
+     * approximation; a stale import can underestimate projected resting burn.
      * [Energy.resting] is resting energy, or the configured baseline in manual mode.
      */
     @RequiresApi(26)
@@ -47,7 +52,11 @@ object TrackerMath {
 
         fun result(burned: Double?, forecast: Double?, source: String, resting: Double?, active: Double?, everyday: Double? = null): Energy {
             val balance = if (meals.isNotEmpty()) burned?.let { intake - it } else null
-            return Energy(intake, burned, forecast, balance, balance?.div(KCAL_PER_KG), source, resting, active, everyday)
+            val safeForecast = forecast?.takeIf { (historical || fraction > 0.0) && it.isFinite() }
+            val projectedBalance = if (meals.isNotEmpty() && meals.all { it.kcal.isFinite() && it.kcal >= 0 } && intake.isFinite()) {
+                safeForecast?.let { (intake - it).takeIf { value -> value.isFinite() } }
+            } else null
+            return Energy(intake, burned, safeForecast, balance, balance?.div(KCAL_PER_KG), source, resting, active, everyday, projectedBalance)
         }
 
         val garmin = data.garmin
@@ -56,11 +65,21 @@ object TrackerMath {
             val active = garmin.active?.takeIf { it.isFinite() && it >= 0 }
             if (data.profile.garminTotalIsResting) {
                 val total = active?.let { garminTotal + it }?.takeIf { it.isFinite() }
-                return result(total, total?.takeIf { historical }, "Garmin", garminTotal, active)
+                val forecast = when {
+                    historical -> total
+                    fraction > 0.0 && active != null -> garminTotal / fraction + active
+                    else -> null
+                }
+                return result(total, forecast, "Garmin", garminTotal, active)
             }
             val includedActive = active?.takeIf { it <= garminTotal }
-            return result(garminTotal, garminTotal.takeIf { historical }, "Garmin",
-                includedActive?.let { garminTotal - it }, includedActive)
+            val resting = includedActive?.let { garminTotal - it }
+            val forecast = when {
+                historical -> garminTotal
+                fraction > 0.0 && resting != null -> resting / fraction + includedActive
+                else -> null
+            }
+            return result(garminTotal, forecast, "Garmin", resting, includedActive)
         }
 
         val workout = data.activities.filter { it.minute <= cutoff }.sumOf { it.kcal }
@@ -76,6 +95,28 @@ object TrackerMath {
         return result(elapsedBaseline?.plus(workout), baseline?.plus(workout), source,
             (resting ?: manual)?.times(fraction), workout,
             resting?.let { it * (SEDENTARY_FACTOR - 1) * fraction })
+    }
+
+    /**
+     * Counts consecutive completed historical days ending yesterday, with intake strictly less
+     * than burn. Missing dates, meals, or energy break the streak; today is never included.
+     * Duplicate dates are ambiguous and also break the streak. Input order does not matter.
+     */
+    @RequiresApi(26)
+    fun deficitStreak(days: List<DayData>, now: LocalDateTime): Int {
+        val byDay = days.groupBy { it.day }
+        var day = now.toLocalDate().minusDays(1)
+        var streak = 0
+        while (true) {
+            val data = byDay[day]?.singleOrNull() ?: break
+            if (data.meals.isEmpty() || data.meals.any { !it.kcal.isFinite() || it.kcal < 0 }) break
+            val energy = energy(data, now)
+            val burn = energy.burned?.takeIf { it.isFinite() && it >= 0 } ?: break
+            if (energy.balance == null || !energy.intake.isFinite() || energy.intake >= burn) break
+            streak++
+            day = day.minusDays(1)
+        }
+        return streak
     }
 
     // The equation estimates resting energy before adding everyday movement and logged workouts.

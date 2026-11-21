@@ -1,5 +1,6 @@
 package com.example.mygarmincaloriestracker
 
+import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
@@ -7,6 +8,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import androidx.annotation.RequiresApi
 import java.io.Closeable
 import java.time.LocalDate
+import java.time.LocalDateTime
 
 data class Food(val id: Long, val name: String, val kcal100: Double, val unitName: String?, val unitGrams: Double?)
 
@@ -67,14 +69,50 @@ class TrackerStore(context: Context) : Closeable {
     ) { Sport(getLong(0), getString(1), getDouble(2), getDouble(3), getDouble(4)) }
 
     fun addFood(name: String, kcal100: Double, unitName: String?, unitGrams: Double?) {
-        require(name.isNotBlank() && kcal100.isNonNegative() && (unitGrams == null || unitGrams.isPositive()))
-        helper.writableDatabase.execSQL(INSERT_FOOD, arrayOf<Any?>(name.trim(), kcal100, unitName, unitGrams))
+        validateFood(name, kcal100, unitName, unitGrams)
+        helper.writableDatabase.transaction {
+            requireUniqueCatalogName("food", name, null)
+            execSQL(INSERT_FOOD, arrayOf<Any?>(name.trim(), kcal100, unitName?.trim()?.ifBlank { null }, unitGrams))
+        }
     }
 
     fun addSport(name: String, light: Double, medium: Double, hard: Double) {
-        require(name.isNotBlank() && listOf(light, medium, hard).all { it.isPositive() })
-        helper.writableDatabase.execSQL(INSERT_SPORT, arrayOf<Any?>(name.trim(), light, medium, hard))
+        validateSport(name, light, medium, hard)
+        helper.writableDatabase.transaction {
+            requireUniqueCatalogName("sport", name, null)
+            execSQL(INSERT_SPORT, arrayOf<Any?>(name.trim(), light, medium, hard))
+        }
     }
+
+    /** Returns false if the catalog entry no longer exists. Logged meals are independent snapshots. */
+    fun updateFood(food: Food): Boolean {
+        validateFood(food.name, food.kcal100, food.unitName, food.unitGrams)
+        val values = ContentValues().apply {
+            put("name", food.name.trim())
+            put("kcal100", food.kcal100)
+            put("unit_name", food.unitName?.trim()?.ifBlank { null })
+            put("unit_grams", food.unitGrams)
+        }
+        return helper.writableDatabase.updateCatalog("food", food.id, food.name, values)
+    }
+
+    /** Returns false if the catalog entry no longer exists. Logged activities are independent snapshots. */
+    fun updateSport(sport: Sport): Boolean {
+        validateSport(sport.name, sport.light, sport.medium, sport.hard)
+        val values = ContentValues().apply {
+            put("name", sport.name.trim())
+            put("light", sport.light)
+            put("medium", sport.medium)
+            put("hard", sport.hard)
+        }
+        return helper.writableDatabase.updateCatalog("sport", sport.id, sport.name, values)
+    }
+
+    /** Deleting catalog entries does not alter logged snapshots. */
+    fun deleteFood(id: Long): Boolean = helper.writableDatabase.delete("food", "id = ?", arrayOf(id.toString())) > 0
+
+    /** Deleting catalog entries does not alter logged snapshots. */
+    fun deleteSport(id: Long): Boolean = helper.writableDatabase.delete("sport", "id = ?", arrayOf(id.toString())) > 0
 
     fun addMeal(day: LocalDate, name: String, grams: Double, kcal: Double, minute: Int) {
         require(name.isNotBlank() && grams.isPositive() && kcal.isNonNegative() && minute in 0..1439)
@@ -82,6 +120,20 @@ class TrackerStore(context: Context) : Closeable {
             "INSERT INTO meal(day, name, grams, kcal, minute) VALUES (?, ?, ?, ?, ?)",
             arrayOf<Any?>(day.toEpochDay(), name.trim(), grams, kcal, minute),
         )
+    }
+
+    /** Keep the recorded energy density even if the catalog entry has changed or was deleted. */
+    fun updateMealAmount(meal: Meal, grams: Double): Boolean {
+        require(grams.isPositive() && meal.grams.isPositive() && meal.kcal.isNonNegative())
+        val kcal = rescaledMealCalories(meal, grams)
+        require(kcal != null)
+        val values = ContentValues().apply {
+            put("grams", grams)
+            put("kcal", kcal)
+        }
+        // Reject stale edits rather than overwriting a meal modified in another dialog.
+        return helper.writableDatabase.update("meal", values, "id = ? AND grams = ? AND kcal = ?",
+            arrayOf(meal.id.toString(), meal.grams.toString(), meal.kcal.toString())) > 0
     }
 
     fun addActivity(day: LocalDate, name: String, minutes: Int, kcal: Double, minute: Int) {
@@ -114,6 +166,43 @@ class TrackerStore(context: Context) : Closeable {
     }
 
     fun day(day: LocalDate): DayData = days(day, day).single()
+
+    /** Each metric may have been recorded on a different day. Future measurements are excluded. */
+    internal fun latestMeasurements(day: LocalDate): LatestMeasurements {
+        val db = helper.readableDatabase
+        val cutoff = minOf(day, LocalDate.now()).toEpochDay().toString()
+        fun latest(column: String): Pair<LocalDate, Double>? = db.rows(
+            "SELECT day, $column FROM body WHERE day <= ? AND $column IS NOT NULL ORDER BY day DESC LIMIT 1",
+            arrayOf(cutoff),
+        ) { LocalDate.ofEpochDay(getLong(0)) to getDouble(1) }.firstOrNull()
+        return LatestMeasurements(latest("weight"), latest("waist"), latest("hip"))
+    }
+
+    /** Counts completed consecutive deficit days ending at the selected date, or yesterday for today. */
+    fun deficitStreak(endInclusive: LocalDate, now: LocalDateTime): Int {
+        val today = now.toLocalDate()
+        if (endInclusive > today || (endInclusive == today && today == LocalDate.MIN)) return 0
+        var date = if (endInclusive == today) today.minusDays(1) else endInclusive
+        val db = helper.readableDatabase
+        var streak = 0
+        while (true) {
+            // Avoid loading a whole day, or any earlier history, once a date has no meals.
+            val hasMeal = db.rows(
+                "SELECT 1 FROM meal WHERE day = ? LIMIT 1", arrayOf(date.toEpochDay().toString()),
+            ) { true }.firstOrNull() == true
+            if (!hasMeal) break
+            val data = day(date)
+            if (data.meals.isEmpty() || data.meals.any { !it.kcal.isFinite() || it.kcal < 0 }) break
+            val energy = TrackerMath.energy(data, now)
+            val burn = energy.burned?.takeIf { it.isFinite() && it >= 0 } ?: break
+            val balance = energy.balance?.takeIf { it.isFinite() } ?: break
+            if (!energy.intake.isFinite() || balance >= 0 || energy.intake >= burn) break
+            streak++
+            if (date == LocalDate.MIN || streak == Int.MAX_VALUE) break
+            date = date.minusDays(1)
+        }
+        return streak
+    }
 
     /** One row per calendar date, including unlogged dates, in ascending order; both endpoints inclusive. */
     fun days(from: LocalDate, to: LocalDate): List<DayData> {
@@ -247,6 +336,39 @@ private class TrackerOpenHelper(context: Context) : SQLiteOpenHelper(context, "t
             error("Missing tracker database migration: $oldVersion -> $newVersion")
         }
     }
+}
+
+/** Thrown when a new or renamed catalog entry conflicts with an existing name. */
+class DuplicateCatalogNameException : IllegalArgumentException("Name bereits vorhanden")
+
+private fun validateFood(name: String, kcal: Double, unit: String?, grams: Double?) {
+    require(name.isNotBlank() && kcal.isNonNegative() && (grams == null || grams.isPositive()))
+    require(unit.isNullOrBlank() || grams != null)
+    require(grams == null || (kcal * (grams / 100.0)).isFinite())
+}
+
+private fun validateSport(name: String, light: Double, medium: Double, hard: Double) {
+    require(name.isNotBlank() && listOf(light, medium, hard).all { it.isPositive() })
+}
+
+// Names use Kotlin's Unicode-aware case-insensitive comparison rather than SQLite's ASCII NOCASE.
+private fun SQLiteDatabase.requireUniqueCatalogName(table: String, name: String, exceptId: Long?) {
+    val duplicate = rows("SELECT id, name FROM $table") { getLong(0) to getString(1) }
+        .any { (id, existing) -> id != exceptId && existing.trim().equals(name.trim(), ignoreCase = true) }
+    if (duplicate) throw DuplicateCatalogNameException()
+}
+
+private fun SQLiteDatabase.updateCatalog(table: String, id: Long, name: String, values: ContentValues): Boolean {
+    var changed = false
+    transaction {
+        val existing = rows("SELECT name FROM $table WHERE id = ?", arrayOf(id.toString())) { getString(0) }.firstOrNull()
+        if (existing != null) {
+            // Existing duplicate names remain editable, but changing a name cannot introduce a collision.
+            if (!existing.trim().equals(name.trim(), ignoreCase = true)) requireUniqueCatalogName(table, name, id)
+            changed = update(table, values, "id = ?", arrayOf(id.toString())) > 0
+        }
+    }
+    return changed
 }
 
 private fun Double.isPositive() = isFinite() && this > 0.0

@@ -8,8 +8,10 @@ appcompat = "1.6.1"
 material = "1.10.0"
 lifecycle = "2.8.7"
 healthConnect = "1.1.0"
+swipeRefresh = "1.2.0"
 
 [libraries]
+androidx-swiperefreshlayout = { group = "androidx.swiperefreshlayout", name = "swiperefreshlayout", version.ref = "swipeRefresh" }
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
 androidx-health-connect = { group = "androidx.health.connect", name = "connect-client", version.ref = "healthConnect" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }

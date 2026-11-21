@@ -100,6 +100,43 @@ internal class TrackerForms(private val context: Context) {
         }
     }
 
+    fun editMealAmount(meal: Meal, onMealUpdated: () -> Unit, save: (Double, (Result<Boolean>) -> Unit) -> Unit) {
+        val form = Form()
+        form.note("${meal.name} · Die ursprünglich erfassten Kalorien pro Gramm bleiben erhalten.")
+        val amount = form.input("Menge (g)", Kind.DECIMAL, initial = meal.grams.asInput())
+        val preview = form.note()
+        val error = form.errorNote()
+        fun updatePreview() {
+            val grams = amount.number()
+            val kcal = grams?.let { rescaledMealCalories(meal, it) }
+            preview.show(kcal?.let { "${format(it)} kcal" })
+        }
+        amount.onChange(::updatePreview)
+        updatePreview()
+        form.dialog("Mahlzeit bearbeiten") submit@{ dialog ->
+            val grams = amount.number() ?: return@submit amount.invalid("Gib eine Menge größer als 0 ein.")
+            if (rescaledMealCalories(meal, grams) == null) return@submit amount.invalid("Für diese Menge lässt sich kein gültiger Kalorienwert berechnen.")
+            val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            val negative = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+            positive.isEnabled = false
+            negative.isEnabled = false
+            dialog.setCancelable(false)
+            error.show(null)
+            save(grams) { result ->
+                if (!dialog.isShowing) return@save
+                positive.isEnabled = true
+                negative.isEnabled = true
+                dialog.setCancelable(true)
+                result.fold(onSuccess = { updated ->
+                    if (updated) {
+                        dialog.dismiss()
+                        onMealUpdated()
+                    } else error.show("Der Eintrag wurde zwischenzeitlich geändert oder gelöscht. Bitte schließe den Dialog und versuche es erneut.")
+                }, onFailure = { error.show("Die Änderung konnte nicht gespeichert werden. Bitte versuche es erneut.") })
+            }
+        }
+    }
+
     fun food(onSave: (String, Double, String?, Double?) -> Unit) {
         val form = Form()
         val name = form.input("Name des Lebensmittels")

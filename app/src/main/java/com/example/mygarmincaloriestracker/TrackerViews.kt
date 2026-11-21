@@ -12,6 +12,7 @@ import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -51,6 +52,13 @@ internal enum class StatsPeriod(val label: String) {
     }
 }
 
+/** Most recent actual measurement for each metric, with its own measurement date. */
+internal data class LatestMeasurements(
+    val weight: Pair<LocalDate, Double>?,
+    val waist: Pair<LocalDate, Double>?,
+    val hip: Pair<LocalDate, Double>?,
+)
+
 @RequiresApi(26)
 internal class TrackerViews(private val context: Context) {
     private val german = Locale.GERMANY
@@ -81,9 +89,19 @@ internal class TrackerViews(private val context: Context) {
         onDeleteMeal: (Long) -> Unit,
         onDeleteActivity: (Long) -> Unit,
         onSettings: () -> Unit,
+        streak: Int = 0,
+        measurements: LatestMeasurements? = null,
+        onEditMeal: (Meal) -> Unit,
     ): View = screen(bottom = 104) {
-        val latest = data.latestBody?.takeIf { it.day <= data.day }
-        val body = data.body
+        val cutoffDate = minOf(data.day, now.toLocalDate())
+        fun latestMetric(provided: Pair<LocalDate, Double>?, value: (Body) -> Double?): Pair<LocalDate, Double>? =
+            (listOfNotNull(provided) + listOfNotNull(data.body, data.latestBody).mapNotNull { body ->
+                value(body)?.let { body.day to it }
+            }).filter { (date, amount) -> date <= cutoffDate && amount.isFinite() && amount > 0 }
+                .maxByOrNull { it.first }
+        val weight = latestMetric(measurements?.weight) { it.weight }
+        val waist = latestMetric(measurements?.waist) { it.waist }
+        val hip = latestMetric(measurements?.hip) { it.hip }
         val energy = TrackerMath.energy(data, now)
         val intake = recordedIntake(data, now, energy)
         addView(label(if (data.day == now.toLocalDate()) "Tagesübersicht" else "Tagesprotokoll", 14, primary, bold = true))
@@ -125,32 +143,59 @@ internal class TrackerViews(private val context: Context) {
             addView(label("Grober Richtwert aus der Energiebilanz, kein gemessenes Gewicht.", 13, muted), margins(top = 10))
         }
         card("Körpermaße") {
-            val weighing = body?.takeIf { it.weight != null } ?: latest?.takeIf { it.weight != null }
-            metric("Gewicht", weighing?.weight, "kg", weighing?.day, data.day)
-            val trend = energy.changeKg
-            if (weighing?.weight != null && trend != null) {
-                val (arrow, word, shade) = direction(trend)
-                addView(label("$arrow $word laut Kalorienbilanz", 14, shade, bold = true), margins(top = 4))
-            }
-            val waist = body?.takeIf { it.waist != null } ?: latest?.takeIf { it.waist != null }
-            val hip = body?.takeIf { it.hip != null } ?: latest?.takeIf { it.hip != null }
-            metric("Taille", waist?.waist, "cm", waist?.day, data.day)
-            metric("Hüfte", hip?.hip, "cm", hip?.day, data.day)
-            if (weighing == null && waist == null && hip == null) {
+            metric("Gewicht", weight?.second, "kg", weight?.first)
+            metric("Taille", waist?.second, "cm", waist?.first)
+            metric("Hüfte", hip?.second, "cm", hip?.first)
+            if (weight == null && waist == null && hip == null) {
                 addView(label("Trage über + deine erste Messung ein.", 14, muted), margins(top = 10))
             }
         }
-        card("Verbrauch & Prognose") {
+        card("Prognose und Erfolge", tinted = true) {
             val isToday = data.day == now.toLocalDate()
             addView(label("Quelle: ${energy.source}", 15, bold = true), margins(top = 8))
             if (isToday) {
-                val explanation = when {
-                    energy.forecast != null -> "Prognose bis Tagesende: ${quantity(energy.forecast, "kcal")} (ohne weitere Aktivitäten)"
-                    energy.source == "Garmin" -> "Garmin liefert den letzten importierten Stand. Er wird nicht hochgerechnet."
-                    else -> "Hinterlege in den Einstellungen einen Grundwert oder importiere Garmin-Daten."
+                val forecast = energy.forecast?.takeIf { it.isFinite() && it >= 0 }
+                if (forecast != null) {
+                    addView(label("Verbrauch bis Tagesende: ${quantity(forecast, "kcal")}", 17, bold = true), margins(top = 8))
+                    if (intake != null && intake.isFinite()) {
+                        val difference = energy.intake - forecast
+                        val direction = when {
+                            difference < 0 -> "Voraussichtliches Defizit"
+                            difference > 0 -> "Voraussichtlicher Überschuss"
+                            else -> "Ausgeglichene Bilanz"
+                        }
+                        val shade = when { difference < 0 -> loss; difference > 0 -> gain; else -> muted }
+                        addView(label("$direction: ${quantity(difference, "kcal", signed = true)}", 16, shade, bold = true), margins(top = 5))
+                    } else {
+                        addView(label("Für eine Bilanzprognose fehlt eine erfasste Mahlzeit.", 14, muted), margins(top = 5))
+                    }
+                    addView(label("Vergleich mit bisher erfasster Aufnahme – sie ist möglicherweise noch nicht vollständig. Weitere Mahlzeiten oder Trainings werden nicht vorhergesagt.${if (energy.source == "Garmin") " Garmin-Hochrechnung aus letztem importiertem Stand; verzögerte Daten können die Prognose verzerren." else ""}", 13, muted), margins(top = 7))
+                } else {
+                    addView(label("Derzeit keine Verbrauchsprognose verfügbar.", 14, muted), margins(top = 6))
                 }
-                addView(label(explanation, 14, muted), margins(top = 6))
             }
+            val completedStreak = streak.coerceAtLeast(0)
+            addView(View(context).apply { setBackgroundColor(outline) }, LinearLayout.LayoutParams(MATCH_PARENT, dp(1)).apply { topMargin = dp(14) })
+            val streakEnd = minOf(data.day, now.toLocalDate().minusDays(1))
+            val streakLabel = if (data.day == now.toLocalDate()) "Defizit-Serie bis gestern" else "Defizit-Serie bis ${dateWithYear.format(streakEnd)}"
+            addView(label(streakLabel, 15, bold = true), margins(top = 12))
+            addView(row().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(label(completedStreak.toString(), 32, if (completedStreak > 0) primary else muted, bold = true))
+                addView(label(if (completedStreak == 1) "  Tag in Folge" else "  Tage in Folge", 15, muted))
+            }, margins(top = 2))
+            if (completedStreak > 0) {
+                addView(row().apply {
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    repeat(minOf(completedStreak, 7)) { index ->
+                        addView(View(context).apply { background = rounded(primary, 12, primary) },
+                            LinearLayout.LayoutParams(dp(12), dp(12)).apply { if (index > 0) marginStart = dp(5) })
+                    }
+                }, margins(top = 8))
+            } else {
+                addView(label("Keine bestätigte Serie für diesen Zeitraum.", 14, muted), margins(top = 4))
+            }
+            addView(label("Nur abgeschlossene Tage mit ausreichenden Daten zählen; fehlende Daten sind keine Bewertung.", 13, muted), margins(top = 7))
             if (data.profile.useGarmin && data.garmin?.total == null) {
                 val syncedActive = data.garmin?.active
                 val detail = if (syncedActive != null) " Importierte Garmin-Aktivkalorien: ${quantity(syncedActive, "kcal")}." else ""
@@ -166,7 +211,8 @@ internal class TrackerViews(private val context: Context) {
             } else {
                 data.meals.sortedBy { it.minute }.forEach { meal ->
                     entry(meal.name, "${time(meal.minute)} · ${quantity(meal.grams, "g", 1)} · ${quantity(meal.kcal, "kcal")}",
-                        "Mahlzeit ${meal.name} löschen") { onDeleteMeal(meal.id) }
+                        deleteLabel = "Mahlzeit ${meal.name} löschen", delete = { onDeleteMeal(meal.id) },
+                        editLabel = "Menge von ${meal.name} bearbeiten", edit = { onEditMeal(meal) })
                 }
             }
         }
@@ -251,7 +297,7 @@ internal class TrackerViews(private val context: Context) {
             StatsPeriod.YEAR -> "Monatssummen aus Tagen mit Daten; bei Körpermaßen zählt je Messreihe der letzte Messwert des Monats."
             else -> "Ein Punkt pro Tag; für heute werden nur die bisher verfügbaren Werte gezeigt."
         }, 14, muted), margins(top = 10))
-        addView(label("Fehlende Werte bleiben Lücken. Nicht erfasste Mahlzeiten zählen nicht als 0 kcal.", 13, muted), margins(top = 5))
+        addView(label("Fehlende Energiewerte bleiben Lücken. Nicht erfasste Mahlzeiten zählen nicht als 0 kcal. Körpermaße verbinden aufeinanderfolgende Messungen.", 13, muted), margins(top = 5))
 
         val ticks = when {
             yearly -> listOf("Jan", "Jun / Jul", "Dez")
@@ -283,11 +329,11 @@ internal class TrackerViews(private val context: Context) {
         }
         card("Geschätzte Gewichtsänderung") {
             addView(label("↑ Zunahme · ↓ Abnahme · aus der Energiebilanz, keine Messung", 14, muted), margins(top = 8))
-            graph(listOf(series(2)), ticks, from, yearly, includeZero = true)
+            graph(listOf(series(2)), ticks, from, yearly, includeZero = true, highlightZero = true)
         }
         addView(title("Gemessene Körpermaße", 20), margins(top = 22))
         (3..5).forEach { index ->
-            card(metrics[index].name) { graph(listOf(series(index)), ticks, from, yearly, includeZero = false) }
+            card(metrics[index].name) { graph(listOf(series(index)), ticks, from, yearly, includeZero = false, connectGaps = true) }
         }
     }
 
@@ -311,7 +357,7 @@ internal class TrackerViews(private val context: Context) {
 
     private fun LinearLayout.graph(
         series: List<Series>, ticks: List<String>, from: LocalDate, yearly: Boolean, includeZero: Boolean,
-        hourly: Boolean = false,
+        hourly: Boolean = false, highlightZero: Boolean = false, connectGaps: Boolean = false,
     ) {
         val values = series.flatMap { line -> line.samples.mapNotNull { it?.value } }
         if (values.isEmpty()) {
@@ -334,10 +380,10 @@ internal class TrackerViews(private val context: Context) {
             if (!includeZero || firstMetric.signed) min -= delta
             max += delta
         }
-        fun formatted(value: Double) = quantity(value, firstMetric.unit, firstMetric.digits, firstMetric.signed)
-        addView(label("Skala: ${formatted(min)} bis ${formatted(max)}", 13, muted), margins(top = 10))
-        addView(Plot(series, min, max), LinearLayout.LayoutParams(MATCH_PARENT, dp(104)).apply { topMargin = dp(6) })
+        val plot = Plot(series, min, max, highlightZero, connectGaps)
+        addView(plot, LinearLayout.LayoutParams(MATCH_PARENT, dp(120)).apply { topMargin = dp(10) })
         addView(row().apply {
+            setPadding(plot.axisInset, 0, dp(6), 0)
             ticks.forEachIndexed { index, caption ->
                 addView(label(caption, 12, muted).apply {
                     gravity = when {
@@ -387,40 +433,70 @@ internal class TrackerViews(private val context: Context) {
     }
 
     /** The plot is paired with a native text list, so values aren't trapped in the canvas. */
-    private inner class Plot(private val series: List<Series>, private val low: Double, private val high: Double) : View(context) {
+    private inner class Plot(
+        private val series: List<Series>, private val low: Double, private val high: Double,
+        private val highlightZero: Boolean, connectGaps: Boolean,
+    ) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP, 11f, resources.displayMetrics)
+            textAlign = Paint.Align.RIGHT
+            color = muted
+        }
         private val dash = DashPathEffect(floatArrayOf(dp(5).toFloat(), dp(4).toFloat()), 0f)
+        private val tickValues = listOf(high, low + (high - low) / 2, low)
+        private val tickLabels = tickValues.map(::formatAxis)
+        private val zeroLabel = formatAxis(0.0)
+        val axisInset: Int = (maxOf(tickLabels.maxOf { textPaint.measureText(it) }, textPaint.measureText(zeroLabel)) + dp(12)).toInt()
+        private val segments = series.map { line -> chartSegments(line.samples.map { it != null }, connectGaps) }
+
+        private fun formatAxis(value: Double): String {
+            val metric = series.first().metric
+            return quantity(value, metric.unit, metric.digits, metric.signed)
+        }
 
         init { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            val pad = dp(6).toFloat()
-            val right = (width - pad).coerceAtLeast(pad)
+            val pad = maxOf(dp(6).toFloat(), (textPaint.descent() - textPaint.ascent()) / 2)
+            val left = axisInset.toFloat().coerceAtMost(width.toFloat())
+            val right = (width - dp(6).toFloat()).coerceAtLeast(left)
             val span = (height - 2 * pad).coerceAtLeast(0f)
             val slots = series.first().samples.size
-            fun x(index: Int) = if (slots == 1) width / 2f else pad + (right - pad) * index / (slots - 1)
+            fun x(index: Int) = if (slots == 1) (left + right) / 2f else left + (right - left) * index / (slots - 1)
             fun y(value: Double) = pad + (1.0 - (value - low) / (high - low)).toFloat() * span
-
-            paint.color = outline
-            paint.strokeWidth = dp(1).toFloat()
-            for (i in 0..2) {
-                val lineY = pad + span * i / 2
-                canvas.drawLine(pad, lineY, right, lineY, paint)
+            fun axisLabel(text: String, lineY: Float, color: Int, bold: Boolean = false) {
+                textPaint.color = color
+                textPaint.typeface = if (bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                val baseline = lineY - (textPaint.ascent() + textPaint.descent()) / 2
+                canvas.drawText(text, left - dp(6), baseline, textPaint)
             }
-            if (low < 0 && high > 0) {
-                paint.color = muted
-                canvas.drawLine(pad, y(0.0), right, y(0.0), paint)
+            val zeroY = if (highlightZero && low <= 0.0 && high >= 0.0) y(0.0) else null
+            val labelHeight = textPaint.descent() - textPaint.ascent()
+            tickValues.forEachIndexed { index, value ->
+                val lineY = y(value)
+                if (zeroY == null || kotlin.math.abs(lineY - zeroY) >= labelHeight) {
+                    paint.color = outline
+                    paint.strokeWidth = dp(1).toFloat()
+                    canvas.drawLine(left, lineY, right, lineY, paint)
+                    axisLabel(tickLabels[index], lineY, muted)
+                }
+            }
+            if (zeroY != null) {
+                paint.color = ink
+                paint.strokeWidth = dp(2).toFloat()
+                canvas.drawLine(left, zeroY, right, zeroY, paint)
+                axisLabel(zeroLabel, zeroY, ink, bold = true)
             }
             series.forEachIndexed { layer, line ->
                 paint.color = line.metric.color
                 paint.strokeWidth = dp(2).toFloat()
                 paint.pathEffect = if (layer == 1) dash else null
-                line.samples.forEachIndexed { index, sample ->
-                    val previous = line.samples.getOrNull(index - 1)
-                    if (sample != null && previous != null) {
-                        canvas.drawLine(x(index - 1), y(previous.value), x(index), y(sample.value), paint)
-                    }
+                segments[layer].forEach { (first, second) ->
+                    val previous = line.samples[first] ?: return@forEach
+                    val current = line.samples[second] ?: return@forEach
+                    canvas.drawLine(x(first), y(previous.value), x(second), y(current.value), paint)
                 }
                 paint.pathEffect = null
                 line.samples.forEachIndexed { index, sample ->
@@ -496,8 +572,8 @@ internal class TrackerViews(private val context: Context) {
             LinearLayout.LayoutParams(MATCH_PARENT, dp(8)).apply { topMargin = dp(6) })
     }
 
-    private fun LinearLayout.metric(name: String, value: Double?, unit: String, date: LocalDate?, day: LocalDate) {
-        val suffix = if (date != null && date != day) " · ${dateWithYear.format(date)}" else ""
+    private fun LinearLayout.metric(name: String, value: Double?, unit: String, date: LocalDate?) {
+        val suffix = if (date != null) " · ${dateWithYear.format(date)}" else ""
         val displayed = if (value == null) "Nicht erfasst" else quantity(value, unit, if (unit == "kg") 2 else 1) + suffix
         addView(label("$name: $displayed", 16, bold = value != null), margins(top = 8))
     }
@@ -507,7 +583,9 @@ internal class TrackerViews(private val context: Context) {
         addView(label(detail, 14, muted), margins(top = 4))
     }
 
-    private fun LinearLayout.entry(name: String, detail: String, deleteLabel: String? = null, delete: (() -> Unit)? = null) {
+    private fun LinearLayout.entry(name: String, detail: String, deleteLabel: String? = null,
+                                   editLabel: String? = null, edit: (() -> Unit)? = null,
+                                   delete: (() -> Unit)? = null) {
         addView(View(context).apply { setBackgroundColor(outline) }, LinearLayout.LayoutParams(MATCH_PARENT, dp(1)).apply { topMargin = dp(10) })
         addView(row().apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -515,11 +593,18 @@ internal class TrackerViews(private val context: Context) {
                 addView(label(name, 16, bold = true))
                 addView(label(detail, 13, muted), margins(top = 3))
             }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-            if (delete != null) {
-                addView(button("Löschen", delete, description = deleteLabel), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
-                    marginStart = dp(6)
-                })
+            fun iconAction(icon: Int, description: String?, action: () -> Unit) = ImageButton(context).apply {
+                setImageResource(icon)
+                imageTintList = ColorStateList.valueOf(primary)
+                setBackgroundResource(android.R.drawable.list_selector_background)
+                contentDescription = description
+                minimumWidth = dp(48)
+                minimumHeight = dp(48)
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+                setOnClickListener { action() }
             }
+            if (edit != null) addView(iconAction(R.drawable.ic_edit_tracker, editLabel, edit), LinearLayout.LayoutParams(dp(48), dp(48)))
+            if (delete != null) addView(iconAction(R.drawable.ic_delete_tracker, deleteLabel, delete), LinearLayout.LayoutParams(dp(48), dp(48)))
         }, margins(top = 8))
     }
 
