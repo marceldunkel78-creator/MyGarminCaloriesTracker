@@ -1,0 +1,13 @@
+<resources>
+    <style name="Theme.MyGarminCaloriesTracker" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#335CB2</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorPrimaryContainer">#DAE2FF</item>
+        <item name="colorOnPrimaryContainer">#122B60</item>
+        <item name="colorSurface">#F8F9FD</item>
+        <item name="colorOnSurface">#191C24</item>
+        <item name="colorSurfaceVariant">#E6EAF4</item>
+        <item name="colorOnSurfaceVariant">#434857</item>
+        <item name="android:windowBackground">#F8F9FD</item>
+    </style>
+</resources>
