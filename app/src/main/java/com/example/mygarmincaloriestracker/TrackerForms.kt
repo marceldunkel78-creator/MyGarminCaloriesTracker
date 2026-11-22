@@ -1,6 +1,7 @@
 package com.example.mygarmincaloriestracker
 
 import android.content.Context
+import android.app.DatePickerDialog
 import android.text.InputType
 import android.text.method.DigitsKeyListener
 import android.view.View
@@ -26,6 +27,7 @@ import com.google.android.material.textview.MaterialTextView
 import java.math.BigDecimal
 import java.text.NumberFormat
 import java.time.LocalDate
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
 import java.util.Locale
@@ -145,9 +147,10 @@ internal class TrackerForms(private val context: Context) {
         dialog.setOnCancelListener { onCancel() }
     }
 
-    fun editDirectMeal(meal: Meal, onMealUpdated: () -> Unit, save: (Double, (Result<Boolean>) -> Unit) -> Unit) {
+    fun editDirectMeal(meal: Meal, day: LocalDate, onMealUpdated: () -> Unit, save: (Double, LocalDate, (Result<Boolean>) -> Unit) -> Unit) {
         val form = Form()
         form.note("${meal.name} · Kalorienaufnahme direkt bearbeiten")
+        val date = form.mealDate(day)
         val kcal = form.input("Kalorien (kcal)", Kind.DECIMAL, meal.kcal.asInput())
         val error = form.errorNote()
         form.dialog("Kalorien bearbeiten") submit@{ dialog ->
@@ -158,7 +161,7 @@ internal class TrackerForms(private val context: Context) {
             negative.isEnabled = false
             dialog.setCancelable(false)
             error.show(null)
-            save(energy) { result ->
+            save(energy, date()) { result ->
                 if (!dialog.isShowing) return@save
                 positive.isEnabled = true
                 negative.isEnabled = true
@@ -223,9 +226,10 @@ internal class TrackerForms(private val context: Context) {
         dialog.setOnCancelListener { onCancel() }
     }
 
-    fun editMealAmount(meal: Meal, onMealUpdated: () -> Unit, save: (Double, (Result<Boolean>) -> Unit) -> Unit) {
+    fun editMealAmount(meal: Meal, day: LocalDate, onMealUpdated: () -> Unit, save: (Double, LocalDate, (Result<Boolean>) -> Unit) -> Unit) {
         val form = Form()
         form.note("${meal.name} · Die ursprünglich erfassten Kalorien pro Gramm bleiben erhalten.")
+        val date = form.mealDate(day)
         val amount = form.input("Menge (g)", Kind.DECIMAL, initial = meal.grams.asInput())
         val preview = form.note()
         val error = form.errorNote()
@@ -245,7 +249,7 @@ internal class TrackerForms(private val context: Context) {
             negative.isEnabled = false
             dialog.setCancelable(false)
             error.show(null)
-            save(grams) { result ->
+            save(grams, date()) { result ->
                 if (!dialog.isShowing) return@save
                 positive.isEnabled = true
                 negative.isEnabled = true
@@ -557,6 +561,23 @@ internal class TrackerForms(private val context: Context) {
             text = label
             if (action != null) setOnClickListener { action() }
             add(this)
+        }
+
+        fun mealDate(initial: LocalDate): () -> LocalDate {
+            var selected = initial
+            val formatter = DateTimeFormatter.ofLocalizedDate(FormatStyle.LONG).withLocale(Locale.GERMANY)
+            val control = button("Datum: ${formatter.format(selected)}")
+            control.contentDescription = "Datum der Mahlzeit: ${formatter.format(selected)}. Zum Ändern tippen."
+            control.setOnClickListener {
+                DatePickerDialog(context, { _, year, month, day ->
+                    selected = LocalDate.of(year, month + 1, day)
+                    control.text = "Datum: ${formatter.format(selected)}"
+                    control.contentDescription = "Datum der Mahlzeit: ${formatter.format(selected)}. Zum Ändern tippen."
+                }, selected.year, selected.monthValue - 1, selected.dayOfMonth).apply {
+                    datePicker.maxDate = LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                }.show()
+            }
+            return { selected }
         }
 
         fun checkbox(label: String): MaterialCheckBox = MaterialCheckBox(context).apply {

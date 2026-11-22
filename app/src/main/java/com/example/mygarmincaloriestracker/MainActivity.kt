@@ -253,12 +253,12 @@ class MainActivity : AppCompatActivity() {
                             onEditMeal = { meal ->
                                 if (!BackupGate.isCurrent(epoch)) return@dashboard
                                 if (meal.isDirect) {
-                                    forms.editDirectMeal(meal, onMealUpdated = { if (BackupGate.isCurrent(epoch)) render(preserveScroll = true) }) { kcal, done ->
-                                        catalogWrite(done, epoch) { store.updateDirectMeal(meal, kcal) }
+                                    forms.editDirectMeal(meal, date, onMealUpdated = { if (BackupGate.isCurrent(epoch)) render(preserveScroll = true) }) { kcal, newDay, done ->
+                                        catalogWrite(done, epoch) { store.updateDirectMeal(meal, date, newDay, kcal) }
                                     }
                                 } else {
-                                    forms.editMealAmount(meal, onMealUpdated = { if (BackupGate.isCurrent(epoch)) render(preserveScroll = true) }) { grams, done ->
-                                        catalogWrite(done, epoch) { store.updateMealAmount(meal, grams) }
+                                    forms.editMealAmount(meal, date, onMealUpdated = { if (BackupGate.isCurrent(epoch)) render(preserveScroll = true) }) { grams, newDay, done ->
+                                        catalogWrite(done, epoch) { store.updateMealAmount(meal, date, newDay, grams) }
                                     }
                                 }
                             })

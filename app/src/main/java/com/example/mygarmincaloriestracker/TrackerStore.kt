@@ -197,12 +197,12 @@ class TrackerStore(context: Context) : Closeable {
         )
     }
 
-    /** Update only the recorded kcal while keeping date, time and name unchanged. */
-    fun updateDirectMeal(meal: Meal, kcal: Double): Boolean {
+    /** Atomically update day and kcal; reject stale edits, preserving name and time. */
+    fun updateDirectMeal(meal: Meal, originalDay: LocalDate, newDay: LocalDate, kcal: Double): Boolean {
         require(meal.isDirect && meal.kcal.isNonNegative() && kcal.isNonNegative())
-        val values = ContentValues().apply { put("kcal", kcal) }
-        return helper.writableDatabase.update("meal", values, "id = ? AND grams = ? AND kcal = ?",
-            arrayOf(meal.id.toString(), "0.0", meal.kcal.toString())) > 0
+        val values = ContentValues().apply { put("day", newDay.toEpochDay()); put("kcal", kcal) }
+        return helper.writableDatabase.update("meal", values, "id = ? AND day = ? AND grams = ? AND kcal = ?",
+            arrayOf(meal.id.toString(), originalDay.toEpochDay().toString(), "0.0", meal.kcal.toString())) > 0
     }
 
     /** Atomically store a confirmed scanned food and meal; same-name catalog items stay unchanged. */
@@ -219,17 +219,18 @@ class TrackerStore(context: Context) : Closeable {
     }
 
     /** Keep the recorded energy density even if the catalog entry has changed or was deleted. */
-    fun updateMealAmount(meal: Meal, grams: Double): Boolean {
+    fun updateMealAmount(meal: Meal, originalDay: LocalDate, newDay: LocalDate, grams: Double): Boolean {
         require(grams.isPositive() && meal.grams.isPositive() && meal.kcal.isNonNegative())
         val kcal = rescaledMealCalories(meal, grams)
         require(kcal != null)
         val values = ContentValues().apply {
+            put("day", newDay.toEpochDay())
             put("grams", grams)
             put("kcal", kcal)
         }
         // Reject stale edits rather than overwriting a meal modified in another dialog.
-        return helper.writableDatabase.update("meal", values, "id = ? AND grams = ? AND kcal = ?",
-            arrayOf(meal.id.toString(), meal.grams.toString(), meal.kcal.toString())) > 0
+        return helper.writableDatabase.update("meal", values, "id = ? AND day = ? AND grams = ? AND kcal = ?",
+            arrayOf(meal.id.toString(), originalDay.toEpochDay().toString(), meal.grams.toString(), meal.kcal.toString())) > 0
     }
 
     fun addActivity(day: LocalDate, name: String, minutes: Int, kcal: Double, minute: Int) {

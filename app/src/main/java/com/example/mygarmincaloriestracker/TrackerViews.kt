@@ -238,7 +238,7 @@ internal class TrackerViews(private val context: Context) {
                         if (meal.isDirect) null else quantity(meal.grams, "g", 1), quantity(meal.kcal, "kcal")).joinToString(" · ")
                     entry(meal.name, detail,
                         deleteLabel = "Mahlzeit ${meal.name} löschen", delete = { onDeleteMeal(meal.id) },
-                        editLabel = if (meal.isDirect) "Kalorien von ${meal.name} bearbeiten" else "Menge von ${meal.name} bearbeiten", edit = { onEditMeal(meal) })
+                        editLabel = if (meal.isDirect) "Kalorien und Datum von ${meal.name} bearbeiten" else "Menge und Datum von ${meal.name} bearbeiten", edit = { onEditMeal(meal) })
                 }
             }
         }
