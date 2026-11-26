@@ -95,6 +95,24 @@ class TrackerBackupInstrumentedTest {
     }
 
     @Test
+    fun legacyRestingFlagInBackupIsPreservedButIgnoredByCalculation() {
+        val tracker = requireNotNull(store)
+        val date = LocalDate.now().minusDays(1)
+        tracker.saveProfile(Profile(useGarmin = true))
+        tracker.addActivity(date, "Manual", 30, 100.0, 600)
+        tracker.saveGarmin(date, GarminDay(1000.0, 200.0, emptyList()))
+        val backup = tracker.backupSnapshot()
+        val profiles = backup.tables.getValue("profile").map { it + ("garmin_total_is_resting" to 1L) }
+        val legacy = backup.copy(tables = backup.tables + ("profile" to profiles))
+        tracker.restoreBackup(BackupJson.read(BackupJson.encode(legacy).inputStream()))
+        assertEquals(legacy, tracker.backupSnapshot())
+        val energy = TrackerMath.energy(tracker.day(date), LocalDate.now().atTime(12, 0))
+        assertEquals(1100.0, requireNotNull(energy.burned), 0.001)
+        assertEquals(300.0, requireNotNull(energy.active), 0.001)
+        assertEquals(800.0, requireNotNull(energy.resting), 0.001)
+    }
+
+    @Test
     fun failedInsertRollsBackAllTablesAndSequences() {
         val tracker = requireNotNull(store)
         populate(tracker)
@@ -169,7 +187,7 @@ class TrackerBackupInstrumentedTest {
         tracker.addActivity(day, "Manual activity", 30, 180.0, 900)
         tracker.saveBody(Body(day, 71.5, null, 98.5))
         // Profile revisions are keyed by the actual local save date.
-        tracker.saveProfile(Profile(35, 175.5, -50, 2100.0, true, true))
+        tracker.saveProfile(Profile(35, 175.5, -50, 2100.0, true))
         tracker.saveGarmin(day, GarminDay(2300.0, null, listOf(
             ActivityEntry(901, "Garmin run", 40, 320.0, 600, "Garmin"),
             ActivityEntry(-4, "Garmin walk", 20, 70.0, 800, "Watch"),
@@ -182,7 +200,7 @@ class TrackerBackupInstrumentedTest {
         tracker.addDirectMeal(day, "Changed meal", 33.0, 50)
         tracker.addActivity(day, "Changed activity", 5, 20.0, 60)
         tracker.saveBody(Body(day, 72.0, 80.0, null))
-        tracker.saveProfile(Profile(40, 180.0, 0, 2000.0, false, false))
+        tracker.saveProfile(Profile(40, 180.0, 0, 2000.0, false))
         tracker.clearGarmin()
         tracker.saveGarmin(day, GarminDay(null, 99.0, listOf(
             ActivityEntry(42, "Changed import", 10, 10.0, 100, "Other"),

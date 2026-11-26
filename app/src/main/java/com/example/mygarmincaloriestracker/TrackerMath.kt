@@ -59,30 +59,23 @@ object TrackerMath {
             return Energy(intake, burned, safeForecast, balance, balance?.div(KCAL_PER_KG), source, resting, active, everyday, projectedBalance)
         }
 
+        val workout = data.activities.filter { it.minute <= cutoff }.sumOf { it.kcal }
         val garmin = data.garmin
         val garminTotal = garmin?.total
         if (data.profile.useGarmin && garminTotal != null && garminTotal.isFinite() && garminTotal >= 0) {
             val active = garmin.active?.takeIf { it.isFinite() && it >= 0 }
-            if (data.profile.garminTotalIsResting) {
-                val total = active?.let { garminTotal + it }?.takeIf { it.isFinite() }
-                val forecast = when {
-                    historical -> total
-                    fraction > 0.0 && active != null -> garminTotal / fraction + active
-                    else -> null
-                }
-                return result(total, forecast, "Garmin", garminTotal, active)
-            }
             val includedActive = active?.takeIf { it <= garminTotal }
             val resting = includedActive?.let { garminTotal - it }
+            val total = (garminTotal + workout).takeIf { it.isFinite() }
             val forecast = when {
-                historical -> garminTotal
-                fraction > 0.0 && resting != null -> resting / fraction + includedActive
+                historical -> total
+                fraction > 0.0 && resting != null -> resting / fraction + includedActive + workout
                 else -> null
             }
-            return result(garminTotal, forecast, "Garmin", resting, includedActive)
+            // A missing Garmin active component remains unknown, even when manual entries exist.
+            return result(total, forecast, "Garmin", resting, includedActive?.plus(workout)?.takeIf { it.isFinite() })
         }
 
-        val workout = data.activities.filter { it.minute <= cutoff }.sumOf { it.kcal }
         val manual = data.profile.manual?.takeIf { it.isFinite() && it > 0 }
         val resting = if (manual == null) mifflin(data) else null
         val baseline = manual ?: resting?.times(SEDENTARY_FACTOR)

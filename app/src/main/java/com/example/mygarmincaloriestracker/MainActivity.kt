@@ -49,7 +49,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
-    private enum class Page { DAY, STATISTICS, SETTINGS, FOODS, SPORTS }
+    private enum class Page { DAY, STATISTICS, SETTINGS, FOODS, SPORTS, HELP }
 
     private val store by lazy { TrackerStore(applicationContext) }
     private val garmin by lazy { GarminHealth(applicationContext) }
@@ -146,6 +146,11 @@ class MainActivity : AppCompatActivity() {
                 if (page != Page.DAY) open(Page.DAY) else finish()
             }
         })
+        val onboarding = getSharedPreferences("onboarding", MODE_PRIVATE)
+        if (savedInstanceState == null && !onboarding.getBoolean("guide_shown", false)) {
+            onboarding.edit().putBoolean("guide_shown", true).apply()
+            page = Page.HELP
+        }
         open(page)
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -201,6 +206,7 @@ class MainActivity : AppCompatActivity() {
             Page.SETTINGS -> "Einstellungen"
             Page.FOODS -> "Lebensmittel-Datenbank"
             Page.SPORTS -> "Aktivitäten-Datenbank"
+            Page.HELP -> "Hilfe & Einrichtung"
         }
         toolbar.menu.clear()
         toolbar.navigationIcon = if (page == Page.DAY) null else getDrawable(R.drawable.ic_back_tracker)
@@ -216,6 +222,7 @@ class MainActivity : AppCompatActivity() {
             toolbar.menu.add("Lebensmittel-Datenbank").setOnMenuItemClickListener { open(Page.FOODS); true }
             toolbar.menu.add("Aktivitäten-Datenbank").setOnMenuItemClickListener { open(Page.SPORTS); true }
             toolbar.menu.add("Einstellungen").setOnMenuItemClickListener { open(Page.SETTINGS); true }
+            toolbar.menu.add("Hilfe").setOnMenuItemClickListener { open(Page.HELP); true }
             toolbar.menu.add("Garmin aktualisieren").setOnMenuItemClickListener { sync(manual = true); true }
         }
         add.visibility = if (page == Page.DAY) View.VISIBLE else View.GONE
@@ -306,6 +313,7 @@ class MainActivity : AppCompatActivity() {
                                 true
                             } })
                     }
+                    Page.HELP -> forms.setupGuide(onSettings = { open(Page.SETTINGS) }, onDone = { open(Page.DAY) })
                     Page.SETTINGS -> {
                         val profile = withContext(Dispatchers.IO) { store.profile() }
                         forms.settings(profile, garmin.available(),

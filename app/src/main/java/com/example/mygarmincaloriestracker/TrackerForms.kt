@@ -304,6 +304,7 @@ internal class TrackerForms(private val context: Context) {
         val pick = form.button("Sportart auswählen")
         val selectionError = form.errorNote()
         val duration = form.input("Dauer (Minuten)", Kind.INTEGER)
+        form.note("Manuelle Aktivitäten werden zusätzlich zum Garmin-Gesamtwert gezählt. Ist dieselbe Aktivität bereits über Garmin synchronisiert, werden Kalorien doppelt gezählt.")
         val manual = form.checkbox("Netto-kcal selbst eingeben")
         val energy = form.input("Zusätzlicher Verbrauch (Netto-kcal)", Kind.DECIMAL)
         val intensityLabel = form.note("Intensität", heading = true)
@@ -411,6 +412,26 @@ internal class TrackerForms(private val context: Context) {
         }
     }
 
+    fun setupGuide(onSettings: () -> Unit, onDone: () -> Unit): View {
+        val form = Form()
+        form.note("Willkommen!", heading = true)
+        form.note("Diese Anleitung verbindet Garmin Connect über Health Connect mit dem Tracker. Die Bezeichnungen in Garmin Connect und Android können je nach Version leicht abweichen. Du kannst die Anleitung jederzeit über Hilfe im Menü erneut öffnen.")
+        form.note("1 · Garmin Connect vorbereiten", heading = true)
+        form.note("Installiere Garmin Connect, melde dich an und kopple deine Garmin-Uhr. Synchronisiere die Uhr mit Garmin Connect und prüfe dort, ob für den gewünschten Tag Kalorien und Aktivitäten angezeigt werden.")
+        form.note("2 · Health Connect freigeben", heading = true)
+        form.note("Der Garmin-Import in dieser App benötigt Android 14 oder neuer und ein verfügbares Health Connect. Öffne in Garmin Connect die Einstellungen für verbundene Apps bzw. Health Connect und verbinde Health Connect. Erlaube Garmin Connect, Gesamtkalorien, Aktivkalorien und Trainingseinheiten an Health Connect zu schreiben. Synchronisiere Garmin Connect erneut. Die Datenübertragung kann verzögert sein.")
+        form.note("3 · Tracker einrichten", heading = true)
+        form.note("Öffne unten die Einstellungen. Aktiviere „Garmin-Tageswert bevorzugen“ und tippe auf „Einstellungen speichern“. Öffne danach die Einstellungen erneut und wähle „Health-Connect-Zugriff verwalten“. Erlaube dieser App den Lesezugriff auf Gesamtkalorien, Aktivkalorien und Trainingseinheiten. Du kannst Berechtigungen später in Health Connect ändern.")
+        form.note("4 · Daten importieren und prüfen", heading = true)
+        form.note("Wähle in der Tagesübersicht den gewünschten Tag. Synchronisiere ihn zuerst in Garmin Connect und wähle anschließend im Menü „Garmin aktualisieren“ oder ziehe die Übersicht nach unten. Vergleiche die Werte mit Garmin Connect. Fehlen Werte, prüfe die Freigaben und versuche es nach der Synchronisierung erneut. Garmin bestimmt, welche Daten bereitgestellt werden.")
+        form.note("5 · Manuell ergänzen", heading = true)
+        form.note("Über + kannst du Mahlzeiten, Körpermaße und Aktivitäten erfassen. Manuelle Aktivitäten werden zusätzlich zu Garmin-Gesamt- und Aktivkalorien gezählt – zum Beispiel, wenn du die Uhr nicht getragen hast. Ist dieselbe Aktivität bereits in Garmin enthalten, werden die Kalorien doppelt gezählt. Importierte Garmin-Aktivitäten werden nicht separat addiert.")
+        form.note("Ohne nutzbaren Garmin-Gesamtwert verwendet die App eine manuelle Tagesbasis oder eine Schätzung aus den in den Einstellungen und Körpermaßen hinterlegten Angaben. Gesundheitsdaten und Einträge bleiben lokal; die Freigaben kannst du jederzeit widerrufen.")
+        form.button("Zu den Einstellungen", onSettings)
+        form.button("Zur Tagesübersicht", onDone)
+        return form.scroll()
+    }
+
     fun settings(
         profile: Profile,
         garminAvailable: Boolean,
@@ -440,13 +461,6 @@ internal class TrackerForms(private val context: Context) {
             minHeight = dp(48)
         }
         form.add(garmin)
-        val garminRestOnly = SwitchMaterial(context).apply {
-            text = "Garmin-Gesamtwert enthält nur Ruhekalorien"
-            isChecked = profile.garminTotalIsResting
-            minHeight = dp(48)
-        }
-        form.add(garminRestOnly)
-        form.note("Nur einschalten, wenn der importierte Gesamtwert den Ruhekalorien in Garmin Connect entspricht. Dann addiert die App die separat importierten Aktivkalorien. Für echte Gesamtwerte ausgeschaltet lassen.")
         form.add(MaterialButton(context).apply {
             text = "Einstellungen speichern"
             setOnClickListener save@{
@@ -462,13 +476,14 @@ internal class TrackerForms(private val context: Context) {
                 if (baseline.value.isNotEmpty() && manual == null) {
                     return@save baseline.invalid("Gib einen Wert größer als 0 ein oder lass das Feld leer.")
                 }
-                onSave(Profile(years, size, offsets.getOrNull(offset.index), manual, garmin.isChecked, garminRestOnly.isChecked))
+                onSave(Profile(years, size, offsets.getOrNull(offset.index), manual, garmin.isChecked))
             }
         })
 
         form.note("Garmin & Health Connect", heading = true)
         form.note("Kein API-Schlüssel nötig. Ab Android 14 kannst du in Garmin Connect die Freigabe an Health Connect aktivieren. Welche Tageswerte und Aktivitäten importiert werden können, hängt davon ab, welche Daten Garmin Connect bereitstellt.")
-        form.note("Wenn ein Garmin-Gesamtwert verwendet wird, rechnet die App keine separat erfassten Workouts hinzu. Ist der Garmin-Tageswert ausgeschaltet, zählen ausschließlich manuell erfasste Aktivitäten; bereits importierte Garmin-Aktivitäten bleiben nur zur Ansicht und werden nicht automatisch aktualisiert.")
+        form.note("Manuelle Aktivitäten werden zusätzlich zu Gesamt- und Aktivkalorien gezählt. Ist eine Aktivität bereits im Garmin-Wert enthalten, werden ihre Kalorien doppelt gezählt. Importierte Garmin-Aktivitäten dienen nur zur Ansicht und werden nicht separat addiert. Ist der Garmin-Tageswert ausgeschaltet, werden sie nicht automatisch aktualisiert. Fehlen Garmin-Aktivkalorien, ist die Aufteilung unbekannt; der Gesamtwert enthält trotzdem die manuellen Aktivitäten.")
+        form.note("Die frühere Option „Garmin-Gesamtwert enthält nur Ruhekalorien“ wird nicht mehr verwendet. Der importierte Gesamtwert gilt immer als Gesamtverbrauch. Dadurch und durch manuelle Aktivitäten können sich auch frühere Tageswerte und Statistiken ändern.")
         if (!garminAvailable) form.note("Health Connect ist für den Garmin-Import auf diesem Gerät derzeit nicht verfügbar.")
         form.note("Erlaube der App den Lesezugriff in Health Connect. Synchronisiere den gewünschten Tag zuerst in Garmin Connect und importiere dann den im Tracker ausgewählten Tag. Diese Aktionen speichern keine Einstellungen.")
         form.button("Health-Connect-Zugriff verwalten", onPermissions).isEnabled = garminAvailable

@@ -123,9 +123,7 @@ internal class TrackerViews(private val context: Context) {
                 energy.active?.let { BurnPart("Aktivkalorien", it, activeColor) },
             )
             val hasSplit = energy.burned != null && energy.resting != null && energy.active != null
-            val missing = if (energy.source == "Garmin" && energy.resting != null && energy.active == null)
-                "Aktivkalorien fehlen – Gesamtwert unbekannt" else "Keine Verbrauchsdaten"
-            energyBar("Verbrauch", energy.burned, max, burnColor, missing, if (hasSplit) parts else emptyList())
+            energyBar("Verbrauch", energy.burned, max, burnColor, "Keine Verbrauchsdaten", if (hasSplit) parts else emptyList())
             if (hasSplit || (energy.burned == null && parts.isNotEmpty())) {
                 parts.forEach { part ->
                     addView(label("●  ${part.name}: ${quantity(part.kcal, "kcal")}", 14, part.color), margins(top = 5))
@@ -225,9 +223,6 @@ internal class TrackerViews(private val context: Context) {
                 val detail = if (syncedActive != null) " Importierte Garmin-Aktivkalorien: ${quantity(syncedActive, "kcal")}." else ""
                 addView(label("Kein vollständiger Garmin-Verbrauch verfügbar.$detail", 13, muted), margins(top = 6))
             }
-            if (energy.source == "Garmin" && data.profile.garminTotalIsResting) {
-                addView(label("Garmin-Verbrauch = importierte Ruhekalorien + importierte Aktivkalorien.", 13, muted), margins(top = 6))
-            }
         }
         card("Mahlzeiten") {
             if (data.meals.isEmpty()) {
@@ -260,6 +255,9 @@ internal class TrackerViews(private val context: Context) {
                 }
                 if (entries.any { it.second }) {
                     addView(label("Garmin-Aktivitäten werden angezeigt und nicht zusätzlich addiert.", 13, muted), margins(top = 8))
+                }
+                if (data.activities.isNotEmpty() && energy.source == "Garmin") {
+                    addView(label("Manuelle Aktivitäten zählen zusätzlich zum Garmin-Gesamtwert. Bereits in Garmin enthaltene Aktivitäten können doppelt gezählt werden.", 13, muted), margins(top = 8))
                 }
             }
         }

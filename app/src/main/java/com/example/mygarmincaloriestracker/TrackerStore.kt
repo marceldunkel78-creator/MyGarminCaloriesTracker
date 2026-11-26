@@ -39,7 +39,6 @@ data class Profile(
     val formulaOffset: Int? = null,
     val manual: Double? = null,
     val useGarmin: Boolean = false,
-    val garminTotalIsResting: Boolean = false,
 )
 
 /** Imported activities are display-only; they are not added to the imported total. */
@@ -258,7 +257,7 @@ class TrackerStore(context: Context) : Closeable {
         helper.writableDatabase.execSQL(
             "INSERT OR REPLACE INTO profile(day, $PROFILE_COLUMNS) VALUES (?, ?, ?, ?, ?, ?, ?)",
             arrayOf<Any?>(LocalDate.now().toEpochDay(), profile.age, profile.height, profile.formulaOffset,
-                profile.manual, if (profile.useGarmin) 1 else 0, if (profile.garminTotalIsResting) 1 else 0),
+                profile.manual, if (profile.useGarmin) 1 else 0, 0),
         )
     }
 
@@ -341,8 +340,7 @@ class TrackerStore(context: Context) : Closeable {
             if (body?.weight != null) latestBody = body
             profileUpdates[key]?.let { baselineProfile = it }
             DayData(LocalDate.ofEpochDay(key), meals[key].orEmpty(), activities[key].orEmpty(),
-                body, latestBody, baselineProfile.copy(useGarmin = garminSettings.useGarmin,
-                    garminTotalIsResting = garminSettings.garminTotalIsResting), garmin[key])
+                body, latestBody, baselineProfile.copy(useGarmin = garminSettings.useGarmin), garmin[key])
         }
     }
 
@@ -389,6 +387,7 @@ private val BACKUP_REAL_COLUMNS = setOf("kcal100", "unit_grams", "light", "mediu
 
 private const val DAY_RANGE = "day BETWEEN ? AND ?"
 private const val BODY_COLUMNS = "day, weight, waist, hip"
+// Retain the obsolete column for backwards-compatible database and backup round trips; ignore its value.
 private const val PROFILE_COLUMNS = "age, height, formula_offset, manual, use_garmin, garmin_total_is_resting"
 private const val INSERT_FOOD = "INSERT INTO food(name, kcal100, unit_name, unit_grams) VALUES (?, ?, ?, ?)"
 private const val INSERT_SPORT = "INSERT INTO sport(name, light, medium, hard) VALUES (?, ?, ?, ?)"
@@ -488,7 +487,7 @@ private fun Cursor.intOrNull(index: Int) = if (isNull(index)) null else getInt(i
 @RequiresApi(26)
 private fun Cursor.bodyRow() = Body(LocalDate.ofEpochDay(getLong(0)), doubleOrNull(1), doubleOrNull(2), doubleOrNull(3))
 private fun Cursor.profileRow(offset: Int) = Profile(intOrNull(offset), doubleOrNull(offset + 1),
-    intOrNull(offset + 2), doubleOrNull(offset + 3), getInt(offset + 4) != 0, getInt(offset + 5) != 0)
+    intOrNull(offset + 2), doubleOrNull(offset + 3), getInt(offset + 4) != 0)
 
 private fun SQLiteDatabase.profileAsOf(day: Long): Profile = rows(
     "SELECT $PROFILE_COLUMNS FROM profile WHERE day <= ? ORDER BY day DESC LIMIT 1", arrayOf(day.toString()),

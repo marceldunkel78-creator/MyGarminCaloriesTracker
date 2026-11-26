@@ -44,39 +44,41 @@ class TrackerMathTest {
     }
 
     @Test
-    fun garminUsesImportedTotalsWithoutCountingWorkoutsTwice() {
+    fun garminAddsManualActivitiesButNotImportedActivities() {
         val garmin = GarminDay(1_700.0, 450.0, listOf(morningWorkout.copy(source = "Garmin")))
         val data = DayData(today, listOf(morningMeal), listOf(morningWorkout), null, null,
             Profile(manual = 2_000.0, useGarmin = true), garmin)
         val energy = TrackerMath.energy(data, noon)
         assertEquals("Garmin", energy.source)
-        assertKcal(1_700.0, energy.burned)
+        assertKcal(2_000.0, energy.burned)
         assertKcal(1_250.0, energy.resting)
-        assertKcal(450.0, energy.active)
-        assertKcal(2_950.0, energy.forecast)
-        assertKcal(-2_450.0, energy.projectedBalance)
+        assertKcal(750.0, energy.active)
+        assertKcal(3_250.0, energy.forecast)
+        assertKcal(-2_750.0, energy.projectedBalance)
+        assertKcal(-1_500.0, energy.balance)
         assertKcal(1_300.0, TrackerMath.energy(data.copy(garmin = garmin.copy(total = null)), noon).burned)
         assertKcal(1_300.0, TrackerMath.energy(data.copy(profile = data.profile.copy(useGarmin = false)), noon).burned)
-        assertKcal(1_700.0, TrackerMath.energy(data.copy(day = today.minusDays(1)), noon).forecast)
+        assertKcal(2_000.0, TrackerMath.energy(data.copy(day = today.minusDays(1)), noon).forecast)
         assertNull(TrackerMath.energy(data.copy(garmin = garmin.copy(active = null)), noon).resting)
     }
 
     @Test
-    fun garminRestOnlyExportAddsActiveExactlyOnce() {
-        val data = DayData(today, listOf(morningMeal), listOf(morningWorkout), null, null,
-            Profile(useGarmin = true, garminTotalIsResting = true),
-            GarminDay(1_000.0, 300.0, listOf(morningWorkout.copy(source = "Garmin"))))
+    fun garminManualEntriesRespectTimeAndUnknownActive() {
+        val data = DayData(today, listOf(morningMeal),
+            listOf(morningWorkout, morningWorkout.copy(id = 2, minute = 721, kcal = 200.0)), null, null,
+            Profile(useGarmin = true), GarminDay(1_000.0, 300.0, emptyList()))
         val energy = TrackerMath.energy(data, noon)
-        assertKcal(1_000.0, energy.resting)
-        assertKcal(300.0, energy.active)
+        assertKcal(700.0, energy.resting)
+        assertKcal(600.0, energy.active)
         assertKcal(1_300.0, energy.burned)
-        assertKcal(2_300.0, energy.forecast)
-        assertKcal(-1_800.0, energy.projectedBalance)
-        assertKcal(-800.0, energy.balance)
+        assertKcal(2_000.0, energy.forecast)
+        assertKcal(1_500.0, TrackerMath.energy(data.copy(day = today.minusDays(1)), noon).burned)
         val incomplete = TrackerMath.energy(data.copy(garmin = data.garmin?.copy(active = null)), noon)
-        assertKcal(1_000.0, incomplete.resting)
-        assertNull(incomplete.burned)
-        assertNull(incomplete.balance)
+        assertNull(incomplete.resting)
+        assertNull(incomplete.active)
+        assertKcal(1_300.0, incomplete.burned)
+        assertNull(incomplete.forecast)
+        assertKcal(-800.0, incomplete.balance)
     }
 
     @Test
@@ -121,9 +123,9 @@ class TrackerMathTest {
         // Breakfast occurs after 6:00 and is not yet included.
         assertNull(morning.projectedBalance)
         val noonEnergy = TrackerMath.energy(data, noon)
-        assertKcal(1_100.0, noonEnergy.forecast)
-        assertKcal(-600.0, noonEnergy.projectedBalance)
-        assertKcal(400.0, TrackerMath.energy(data.copy(meals = listOf(morningMeal.copy(kcal = 1_500.0))), noon).projectedBalance)
+        assertKcal(1_400.0, noonEnergy.forecast)
+        assertKcal(-900.0, noonEnergy.projectedBalance)
+        assertKcal(100.0, TrackerMath.energy(data.copy(meals = listOf(morningMeal.copy(kcal = 1_500.0))), noon).projectedBalance)
     }
 
     @Test
@@ -134,7 +136,6 @@ class TrackerMathTest {
         assertNull(TrackerMath.energy(data, noon).projectedBalance)
         assertNull(TrackerMath.energy(data.copy(garmin = data.garmin?.copy(active = 1_001.0)), noon).forecast)
         assertNull(TrackerMath.energy(data.copy(garmin = data.garmin?.copy(active = Double.NaN)), noon).forecast)
-        assertNull(TrackerMath.energy(data.copy(profile = data.profile.copy(garminTotalIsResting = true)), noon).forecast)
         assertKcal(1_000.0, TrackerMath.energy(data.copy(day = today.minusDays(1)), noon).forecast)
     }
 
