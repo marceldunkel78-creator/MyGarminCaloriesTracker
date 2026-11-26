@@ -107,9 +107,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         day = savedInstanceState?.getLong("day")?.let(LocalDate::ofEpochDay) ?: LocalDate.now()
-        anchor = savedInstanceState?.getLong("anchor")?.let(LocalDate::ofEpochDay) ?: day
+        anchor = minOf(savedInstanceState?.getLong("anchor")?.let(LocalDate::ofEpochDay) ?: LocalDate.now(), LocalDate.now())
         page = savedInstanceState?.getString("page")?.let(Page::valueOf) ?: Page.DAY
-        period = savedInstanceState?.getString("period")?.let(StatsPeriod::valueOf) ?: StatsPeriod.WEEK
+        period = StatsPeriod.fromSavedName(savedInstanceState?.getString("period"))
         syncAfterPermission = savedInstanceState?.getBoolean("syncAfterPermission") ?: false
         permissionEpoch = savedInstanceState?.takeIf { it.containsKey("permissionEpoch") }?.getLong("permissionEpoch")
         documentEpoch = savedInstanceState?.takeIf { it.containsKey("documentEpoch") }?.getLong("documentEpoch")
@@ -199,7 +199,7 @@ class MainActivity : AppCompatActivity() {
     private fun open(next: Page, resetAnchor: Boolean = false) {
         if (next != Page.STATISTICS) statsTarget = null
         page = next
-        if (resetAnchor) anchor = day
+        if (resetAnchor) anchor = LocalDate.now()
         toolbar.title = when (page) {
             Page.DAY -> "MyGarmin Calorie Tracker"
             Page.STATISTICS -> "Statistik"

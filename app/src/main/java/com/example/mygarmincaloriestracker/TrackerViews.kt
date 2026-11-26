@@ -26,34 +26,49 @@ import com.google.android.material.R as MaterialR
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.MaterialColors
 import java.text.NumberFormat
-import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
-import java.time.temporal.TemporalAdjusters
 import java.util.Locale
 import kotlin.math.roundToInt
 
-/** Calendar periods with inclusive endpoints and Monday as the first day of the week. */
+/** Trailing periods with inclusive endpoints. */
 @RequiresApi(26)
 internal enum class StatsPeriod(val label: String) {
-    DAY("Tag"), WEEK("Woche"), MONTH("Monat"), YEAR("Jahr");
+    WEEK("Woche"), MONTH("Monat"), YEAR("Jahr");
+
+    companion object {
+        fun fromSavedName(name: String?): StatsPeriod = entries.firstOrNull { it.name == name } ?: WEEK
+    }
 
     fun range(anchor: LocalDate): Pair<LocalDate, LocalDate> = when (this) {
-        DAY -> anchor to anchor
-        WEEK -> anchor.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY)).let { it to it.plusDays(6) }
-        MONTH -> anchor.withDayOfMonth(1) to anchor.withDayOfMonth(anchor.lengthOfMonth())
-        YEAR -> anchor.withDayOfYear(1) to anchor.withDayOfYear(anchor.lengthOfYear())
+        WEEK -> anchor.minusDays(6) to anchor
+        MONTH -> anchor.minusMonths(1) to anchor
+        YEAR -> anchor.minusYears(1).plusDays(1) to anchor
     }
 
     fun move(anchor: LocalDate, step: Int): LocalDate = when (this) {
-        DAY -> anchor.plusDays(step.toLong())
         WEEK -> anchor.plusWeeks(step.toLong())
         MONTH -> anchor.plusMonths(step.toLong())
         YEAR -> anchor.plusYears(step.toLong())
     }
 }
+
+@RequiresApi(26)
+internal fun statsMonthSlots(from: LocalDate, to: LocalDate): List<Pair<LocalDate, LocalDate>> {
+    require(from <= to)
+    val count = statsMonthIndex(from, to) + 1
+    val firstMonth = from.withDayOfMonth(1)
+    return List(count) { index ->
+        val month = firstMonth.plusMonths(index.toLong())
+        maxOf(from, month) to minOf(to, month.withDayOfMonth(month.lengthOfMonth()))
+    }
+}
+
+@RequiresApi(26)
+internal fun statsMonthIndex(from: LocalDate, date: LocalDate): Int =
+    ChronoUnit.MONTHS.between(from.withDayOfMonth(1), date.withDayOfMonth(1)).toInt()
 
 internal enum class StatsTarget { ENERGY, CHANGE, BODY }
 
@@ -71,8 +86,7 @@ internal class TrackerViews(private val context: Context) {
     private val shortDate = DateTimeFormatter.ofPattern("dd.MM.", german)
     private val dateWithYear = DateTimeFormatter.ofPattern("dd.MM.yyyy", german)
     private val monthDate = DateTimeFormatter.ofPattern("MMMM yyyy", german)
-    private val monthName = DateTimeFormatter.ofPattern("MMMM", german)
-    private val clock = DateTimeFormatter.ofPattern("HH:mm", german)
+    private val monthTick = DateTimeFormatter.ofPattern("MMM yy", german)
     private val surface = color(MaterialR.attr.colorSurface, 0xFFFFFFFF.toInt())
     private val dark = ColorUtils.calculateLuminance(surface) < 0.35
     private val ink = color(MaterialR.attr.colorOnSurface, if (dark) 0xFFF7F3FA.toInt() else 0xFF201A25.toInt())
@@ -275,23 +289,26 @@ internal class TrackerViews(private val context: Context) {
         val (from, to) = period.range(anchor)
         val today = now.toLocalDate()
         val yearly = period == StatsPeriod.YEAR
-        val slots = if (yearly) 12 else ChronoUnit.DAYS.between(from, to).toInt() + 1
+        val months = if (yearly) statsMonthSlots(from, to) else emptyList()
+        val slots = if (yearly) months.size else ChronoUnit.DAYS.between(from, to).toInt() + 1
         val metrics = listOf(
             Metric("Aufnahme", "kcal", primary, 0), Metric("Verbrauch", "kcal", burnColor, 0),
             Metric("Geschätzte Gewichtsänderung", "kg", ink, 2, signed = true),
             Metric("Gewicht", "kg", primary, 2), Metric("Taille", "cm", primary, 1), Metric("Hüfte", "cm", primary, 1),
         )
         val samples = List(metrics.size) { arrayOfNulls<Sample>(slots) }
+        val dailyValues = List(metrics.size) { mutableListOf<Pair<LocalDate, Double>>() }
         // One pass over the supplied days. Sum available energy values; retain the latest actual
         // measurement independently for each body metric. Null slots never become zeroes.
         data.forEach { day ->
             if (day.day < from || day.day > to || day.day > today) return@forEach
-            val index = if (yearly) day.day.monthValue - 1 else ChronoUnit.DAYS.between(from, day.day).toInt()
+            val index = if (yearly) statsMonthIndex(from, day.day) else ChronoUnit.DAYS.between(from, day.day).toInt()
             val energy = TrackerMath.energy(day, now)
             val body = day.body?.takeIf { it.day == day.day }
             val values = listOf(recordedIntake(day, now, energy), energy.burned, energy.changeKg, body?.weight, body?.waist, body?.hip)
             values.forEachIndexed { metric, value ->
                 if (value == null || !value.isFinite()) return@forEachIndexed
+                dailyValues[metric].add(day.day to value)
                 val old = samples[metric][index]
                 samples[metric][index] = when {
                     yearly && metric < 3 && old != null -> Sample(old.value + value, maxOf(day.day, old.date), old.count + 1)
@@ -302,30 +319,28 @@ internal class TrackerViews(private val context: Context) {
         }
 
         addView(title("Statistik", 24))
-        StatsPeriod.entries.chunked(2).forEach { options ->
-            addView(buttonPair(options.map { item -> button(item.label, { onPeriod(item) }, selected = item == period) }), margins(top = 6))
-        }
-        val interval = when (period) {
-            StatsPeriod.DAY -> fullDate.format(from)
-            StatsPeriod.MONTH -> monthDate.format(from)
-            StatsPeriod.YEAR -> from.year.toString()
-            StatsPeriod.WEEK -> "${if (from.year == to.year) shortDate.format(from) else dateWithYear.format(from)} – ${dateWithYear.format(to)}"
-        }
+        addView(buttonPair(StatsPeriod.entries.map { item ->
+            button(item.label, { onPeriod(item) }, selected = item == period).apply {
+                minWidth = 0
+                setPadding(dp(4), paddingTop, dp(4), paddingBottom)
+            }
+        }), margins(top = 6))
+        val interval = "${if (from.year == to.year) shortDate.format(from) else dateWithYear.format(from)} – ${dateWithYear.format(to)}"
         addView(title(interval, 19).apply { gravity = Gravity.CENTER }, margins(top = 14))
         addView(buttonPair(listOf(
             button("‹ Zurück", { onStep(-1) }, description = "Vorheriger Zeitraum: ${period.label}"),
             button("Weiter ›", { onStep(1) }, enabled = to < today, description = "Nächster Zeitraum: ${period.label}"),
         )), margins(top = 6))
         addView(label(when (period) {
-            StatsPeriod.DAY -> if (from == today) "Tageswerte für heute zeigen den Stand um ${clock.format(now)} Uhr."
-                else "Tageswerte und erfasste Mahlzeiten nach Uhrzeit."
-            StatsPeriod.YEAR -> "Monatssummen aus Tagen mit Daten; bei Körpermaßen zählt je Messreihe der letzte Messwert des Monats."
+            StatsPeriod.YEAR -> "Monatssummen aus Tagen im Zeitraum; Randmonate können unvollständig sein. Bei Körpermaßen zählt je Messreihe der letzte Messwert des Monats."
             else -> "Ein Punkt pro Tag; für heute werden nur die bisher verfügbaren Werte gezeigt."
         }, 14, muted), margins(top = 10))
         addView(label("Fehlende Energiewerte bleiben Lücken. Nicht erfasste Mahlzeiten zählen nicht als 0 kcal. Körpermaße verbinden aufeinanderfolgende Messungen.", 13, muted), margins(top = 5))
 
         val ticks = when {
-            yearly -> listOf("Jan", "Jun / Jul", "Dez")
+            yearly -> listOf(monthTick.format(months.first().first),
+                if (slots % 2 == 1) monthTick.format(months[slots / 2].first) else "",
+                monthTick.format(months.last().first))
             slots == 1 -> listOf(shortDate.format(from))
             slots % 2 == 1 -> listOf(from, from.plusDays(slots.toLong() / 2), to).map(shortDate::format)
             else -> listOf(shortDate.format(from), "", shortDate.format(to))
@@ -333,32 +348,22 @@ internal class TrackerViews(private val context: Context) {
         fun series(index: Int) = Series(metrics[index], samples[index])
         card("Energieverlauf") {
             addView(label("● Aufnahme  ·  ■ Verbrauch", 14, muted), margins(top = 8))
-            graph(listOf(series(0), series(1)), ticks, from, yearly, includeZero = true)
+            graph(listOf(series(0), series(1)), ticks, from, yearly, includeZero = true, monthSlots = months)
         }.tag = StatsTarget.ENERGY
-        if (period == StatsPeriod.DAY) {
-            val mealsByHour = arrayOfNulls<Sample>(24)
-            val cutoff = if (from == today) now.hour * 60 + now.minute else 1439
-            if (from <= today) {
-                data.firstOrNull { it.day == from }?.meals?.forEach { meal ->
-                    if (meal.minute in 0..cutoff && meal.kcal.isFinite()) {
-                        val hour = meal.minute / 60
-                        mealsByHour[hour] = Sample((mealsByHour[hour]?.value ?: 0.0) + meal.kcal, from)
-                    }
-                }
-            }
-            card("Aufnahme nach Uhrzeit") {
-                addView(label("Summe der erfassten Mahlzeiten je Stunde. Für den Verbrauch gibt es nur einen Tageswert.", 14, muted), margins(top = 8))
-                graph(listOf(Series(metrics[0], mealsByHour)), listOf("00 Uhr", "", "23 Uhr"), from,
-                    yearly = false, includeZero = true, hourly = true)
-            }
-        }
         card("Geschätzte Gewichtsänderung") {
             addView(label("↑ Zunahme · ↓ Abnahme · aus der Energiebilanz, keine Messung", 14, muted), margins(top = 8))
-            graph(listOf(series(2)), ticks, from, yearly, includeZero = true, highlightZero = true)
+            val total = StatsSummary.sum(dailyValues[2], from, to, today)
+            val summary = if (total == null) "Summe: Keine Werte" else "Summe: ${quantity(total, "kg", 2, signed = true)}"
+            graph(listOf(series(2)), ticks, from, yearly, includeZero = true, highlightZero = true, monthSlots = months, summary = summary)
         }.tag = StatsTarget.CHANGE
         addView(title("Gemessene Körpermaße", 20), margins(top = 22))
         (3..5).forEach { index ->
-            card(metrics[index].name) { graph(listOf(series(index)), ticks, from, yearly, includeZero = false, connectGaps = true) }
+            card(metrics[index].name) {
+                val difference = StatsSummary.difference(dailyValues[index], from, to, today)
+                val summary = if (difference == null) "Änderung: Mindestens 2 Messungen nötig"
+                    else "Änderung: ${quantity(difference, metrics[index].unit, metrics[index].digits, signed = true)}"
+                graph(listOf(series(index)), ticks, from, yearly, includeZero = false, connectGaps = true, monthSlots = months, summary = summary)
+            }
                 .apply { if (index == 3) tag = StatsTarget.BODY }
         }
     }.apply {
@@ -393,11 +398,13 @@ internal class TrackerViews(private val context: Context) {
 
     private fun LinearLayout.graph(
         series: List<Series>, ticks: List<String>, from: LocalDate, yearly: Boolean, includeZero: Boolean,
-        hourly: Boolean = false, highlightZero: Boolean = false, connectGaps: Boolean = false,
+        highlightZero: Boolean = false, connectGaps: Boolean = false,
+        monthSlots: List<Pair<LocalDate, LocalDate>> = emptyList(), summary: String? = null,
     ) {
         val values = series.flatMap { line -> line.samples.mapNotNull { it?.value } }
         if (values.isEmpty()) {
             addView(label("Keine Werte in diesem Zeitraum.", 14, muted), margins(top = 10))
+            if (summary != null) addView(label(summary, 14, muted).apply { gravity = Gravity.END }, margins(top = 6))
             return
         }
         val firstMetric = series.first().metric
@@ -451,8 +458,10 @@ internal class TrackerViews(private val context: Context) {
                     }
                     if (entries.isNotEmpty()) {
                         val caption = when {
-                            hourly -> time(index * 60)
-                            yearly -> monthName.format(from.plusMonths(index.toLong()))
+                            yearly -> {
+                                val (start, end) = monthSlots[index]
+                                "${monthDate.format(start)} (${dateWithYear.format(start)} – ${dateWithYear.format(end)})"
+                            }
                             else -> shortDate.format(from.plusDays(index.toLong()))
                         }
                         details.addView(label("$caption · ${entries.joinToString(" · ")}", 14), margins(top = 6))
@@ -464,7 +473,18 @@ internal class TrackerViews(private val context: Context) {
             toggle.text = "Werte $verb"
             toggle.contentDescription = "Werte für ${series.joinToString(" und ") { it.metric.name }} $verb"
         }
-        addView(toggle, margins(top = 6, width = WRAP_CONTENT))
+        if (summary == null) {
+            addView(toggle, margins(top = 6, width = WRAP_CONTENT))
+        } else {
+            addView(row().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                toggle.minWidth = 0
+                toggle.setPadding(dp(4), toggle.paddingTop, dp(4), toggle.paddingBottom)
+                addView(toggle, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                addView(label(summary, 14, muted).apply { gravity = Gravity.END },
+                    LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(8) })
+            }, margins(top = 6))
+        }
         addView(details, margins(top = 2))
     }
 
