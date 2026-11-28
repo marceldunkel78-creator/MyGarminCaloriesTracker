@@ -14,14 +14,14 @@ internal data class BackupData(
  * A caller must not modify the source while validation is in progress.
  */
 internal object BackupValidation {
-    const val VERSION = 1L
+    const val VERSION = 2L
     const val MAX_ROWS = 100_000
     // The transport byte limit already bounds text allocation; app inputs have no smaller cap.
     const val MAX_TEXT_LENGTH = BackupJson.MAX_BYTES
     private val minDay = LocalDate.MIN.toEpochDay()
     private val maxDay = LocalDate.MAX.toEpochDay()
 
-    private enum class Kind { ID, SIGNED, DAY, POSITION, MINUTE, POSITIVE_INT, FLAG, TEXT, NONNEGATIVE, POSITIVE }
+    private enum class Kind { ID, SIGNED, DAY, POSITION, MINUTE, POSITIVE_INT, FLAG, TEXT, NONNEGATIVE, POSITIVE, PERCENT }
     private data class Column(val name: String, val kind: Kind, val nullable: Boolean = false)
     private data class Table(val columns: List<Column>, val key: List<String>)
     private fun col(name: String, kind: Kind, nullable: Boolean = false) = Column(name, kind, nullable)
@@ -30,7 +30,8 @@ internal object BackupValidation {
         "sport" to Table(listOf(col("id", Kind.ID), col("name", Kind.TEXT), col("light", Kind.POSITIVE), col("medium", Kind.POSITIVE), col("hard", Kind.POSITIVE)), listOf("id")),
         "meal" to Table(listOf(col("id", Kind.ID), col("day", Kind.DAY), col("name", Kind.TEXT), col("grams", Kind.NONNEGATIVE), col("kcal", Kind.NONNEGATIVE), col("minute", Kind.MINUTE)), listOf("id")),
         "activity" to Table(listOf(col("id", Kind.ID), col("day", Kind.DAY), col("name", Kind.TEXT), col("minutes", Kind.POSITIVE_INT), col("kcal", Kind.NONNEGATIVE), col("minute", Kind.MINUTE)), listOf("id")),
-        "body" to Table(listOf(col("day", Kind.DAY), col("weight", Kind.POSITIVE, true), col("waist", Kind.POSITIVE, true), col("hip", Kind.POSITIVE, true)), listOf("day")),
+        "body" to Table(listOf(col("day", Kind.DAY), col("weight", Kind.POSITIVE, true), col("waist", Kind.POSITIVE, true), col("hip", Kind.POSITIVE, true), col("body_fat", Kind.PERCENT, true)), listOf("day")),
+        "imported_body" to Table(listOf(col("day", Kind.DAY), col("weight", Kind.POSITIVE, true), col("body_fat", Kind.PERCENT, true)), listOf("day")),
         "profile" to Table(listOf(col("day", Kind.DAY), col("age", Kind.POSITIVE_INT, true), col("height", Kind.POSITIVE, true), col("formula_offset", Kind.SIGNED, true), col("manual", Kind.POSITIVE, true), col("use_garmin", Kind.FLAG), col("garmin_total_is_resting", Kind.FLAG)), listOf("day")),
         "garmin_day" to Table(listOf(col("day", Kind.DAY), col("total", Kind.NONNEGATIVE, true), col("active", Kind.NONNEGATIVE, true)), listOf("day")),
         "garmin_activity" to Table(listOf(col("day", Kind.DAY), col("position", Kind.POSITION), col("entry_id", Kind.SIGNED), col("name", Kind.TEXT), col("minutes", Kind.POSITIVE_INT), col("kcal", Kind.NONNEGATIVE), col("minute", Kind.MINUTE), col("source", Kind.TEXT)), listOf("day", "position")),
@@ -38,12 +39,17 @@ internal object BackupValidation {
 
     /** Returns a defensive copy. Throws without exposing personal data in error messages. */
     fun validate(input: BackupData): BackupData {
-        require(input.version == VERSION) { "Unsupported backup version" }
-        require(input.tables.keys == schema.keys) { "Unexpected backup tables" }
+        require(input.version == 1L || input.version == VERSION) { "Unsupported backup version" }
+        val tables = if (input.version == 1L) {
+            require(input.tables.keys == schema.keys - "imported_body") { "Unexpected backup tables" }
+            require(input.tables.getValue("body").all { it.keys == setOf("day", "weight", "waist", "hip") }) { "Unexpected backup columns" }
+            input.tables + ("body" to input.tables.getValue("body").map { it + ("body_fat" to null) }) + ("imported_body" to emptyList())
+        } else input.tables
+        require(tables.keys == schema.keys) { "Unexpected backup tables" }
         var count = 0L
         val copy = linkedMapOf<String, List<Map<String, Any?>>>()
         for ((name, table) in schema) {
-            val rows = input.tables.getValue(name)
+            val rows = tables.getValue(name)
             count += rows.size.toLong()
             require(count <= MAX_ROWS) { "Too many backup rows" }
             val keys = HashSet<List<Any?>>()
@@ -93,6 +99,7 @@ internal object BackupValidation {
             Kind.FLAG -> value is Long && value in 0..1
             Kind.NONNEGATIVE -> value is Double && value.isFinite() && value >= 0.0
             Kind.POSITIVE -> value is Double && value.isFinite() && value > 0.0
+            Kind.PERCENT -> value is Double && value.isFinite() && value in 0.0..100.0
         }
     }
 }

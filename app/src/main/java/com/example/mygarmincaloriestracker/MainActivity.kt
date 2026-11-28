@@ -328,9 +328,10 @@ class MainActivity : AppCompatActivity() {
                             onImport = { if (BackupGate.isCurrent(epoch)) chooseBackupImport() },
                             onClear = {
                                 if (BackupGate.isCurrent(epoch)) syncJob?.cancel()
-                                change("Garmin-Importe gelöscht. Automatischer Import ist aus.", epoch) {
+                                change("Health-Connect-Importe gelöscht. Garmin-Tageswert ist aus.", epoch) {
                                     store.saveProfile(store.profile().copy(useGarmin = false))
                                     store.clearGarmin()
+                                    store.clearImportedBody()
                                 }
                             })
                     }
@@ -429,7 +430,7 @@ class MainActivity : AppCompatActivity() {
                 when (which) {
                     0 -> meal(date, epoch)
                     1 -> activity(date, epoch)
-                    2 -> load(epoch, { store.day(date).body }) { existing ->
+                    2 -> load(epoch, { store.manualBody(date) }) { existing ->
                         forms.body(existing, date) { body -> change("Körpermaße gespeichert.", epoch) { store.saveBody(body) } }
                     }
                 }
@@ -618,7 +619,7 @@ class MainActivity : AppCompatActivity() {
         }
         MaterialAlertDialogBuilder(this)
             .setTitle("Garmin-Daten lesen")
-            .setMessage("Die App liest nur von Garmin freigegebene Kalorien und Trainings aus Health Connect. Importierte Daten bleiben lokal auf diesem Gerät.")
+            .setMessage("Die App liest Garmin-Kalorien und Trainings sowie Gewicht und Körperfett aus allen freigegebenen Health-Connect-Quellen. Manuelle Messwerte haben Vorrang. Importierte Daten bleiben lokal auf diesem Gerät.")
             .setNegativeButton("Abbrechen", null)
             .setNeutralButton("Health Connect öffnen") { _, _ ->
                 if (Build.VERSION.SDK_INT >= 34) {
@@ -659,9 +660,27 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
                 if (manual && !fromRefresh) toast("Garmin-Daten werden gelesen …")
-                val result = garmin.read(date, includeDetails = manual)
+                var bodyError = false
+                val body = try {
+                    val read = garmin.readBody(date)
+                    bodyError = read.partialFailure
+                    read.body
+                } catch (e: CancellationException) { throw e } catch (_: Exception) {
+                    bodyError = true
+                    Body(date, null, null, null)
+                }
+                if (!BackupGate.isCurrent(epoch)) return@launch
+                if (body.weight != null || body.bodyFat != null) withContext(Dispatchers.IO) {
+                    BackupGate.write(epoch) { store.saveImportedBody(body) }
+                }
+                var energyError = false
+                val result = try { garmin.read(date, includeDetails = manual) } catch (e: CancellationException) { throw e } catch (_: Exception) {
+                    energyError = true
+                    GarminHealth.ReadResult(GarminDay(null, null, emptyList()))
+                }
                 if (!BackupGate.isCurrent(epoch)) return@launch
                 val data = result.data
+                val hasBody = body.weight != null || body.bodyFat != null
                 val hasData = data.total != null || data.active != null || data.activities.isNotEmpty()
                 if (hasData) withContext(Dispatchers.IO) {
                     BackupGate.write(epoch) {
@@ -675,9 +694,9 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 if (!BackupGate.isCurrent(epoch)) return@launch
-                if (page == Page.DAY && day == date && hasData) render(preserveScroll = true)
+                if (page == Page.DAY && day == date && (hasData || hasBody)) render(preserveScroll = true)
                 if (fromRefresh) {
-                    toast(if (!hasData) "Keine Garmin-Daten für diesen Tag gefunden." else if (data.total == null) "Aktivitäten importiert; kein vollständiger Garmin-Verbrauch verfügbar." else "Garmin-Daten aktualisiert.")
+                    toast(if (bodyError || energyError) "Import teilweise fehlgeschlagen. Prüfe Berechtigungen und Verlauf." else if (!hasData && hasBody) "Körpermaße importiert." else if (!hasData) "Keine Daten für diesen Tag gefunden." else if (data.total == null) "Aktivitäten importiert; kein vollständiger Garmin-Verbrauch verfügbar." else "Garmin-Daten aktualisiert.")
                 } else if (manual) {
                     val displayDate = date.format(DateTimeFormatter.ofPattern("dd.MM.yyyy", Locale.GERMANY))
                     val format = java.text.NumberFormat.getNumberInstance(Locale.GERMANY).apply { maximumFractionDigits = 1 }
@@ -686,7 +705,9 @@ class MainActivity : AppCompatActivity() {
                         append("Garmin-Werte aus Health Connect:\n\n")
                         append("Verwendbarer Gesamtwert: ${kcal(data.total)}\n")
                         append("Aktivkalorien: ${kcal(data.active)}\n")
-                        append("Aktivitäten: ${data.activities.size}")
+                        append("Aktivitäten: ${data.activities.size}\n")
+                        append("Körpermaße: ${if (bodyError) "Lesen fehlgeschlagen – Berechtigungen und Verlauf prüfen" else if (hasBody) "importiert" else "keine verfügbar"}")
+                        if (energyError) append("\nGarmin-Werte konnten nicht gelesen werden; Berechtigungen und Verlauf prüfen.")
                         if (data.total == null) append("\n\nKein vollständiger Kalorienwert verfügbar. Einzelne Aktivitätswerte sind kein Tagesverbrauch.")
                     }
                     MaterialAlertDialogBuilder(this@MainActivity)
@@ -798,7 +819,7 @@ class HealthPrivacyActivity : AppCompatActivity() {
                 setPadding(spacing, spacing * 2, spacing, spacing * 2)
                 textSize = 17f
                 text = "Datenschutz · Kalorien & Maße\n\n" +
-                    "Mit deiner Freigabe liest die App Garmin-Trainings sowie Gesamt- und Aktivitätskalorien aus Health Connect. Sie nutzt diese Werte für dein Protokoll und deine Kalorienbilanz. Sie schreibt keine Daten nach Health Connect. Beim Barcode-Scan wird der Produktcode an Open Food Facts zur Produktsuche gesendet; Gesundheits- und Mahlzeitendaten werden nicht übertragen.\n\n" +
+                    "Mit deiner Freigabe liest die App Garmin-Trainings sowie Gesamt- und Aktivitätskalorien und Gewicht und Körperfett aus Health Connect (Körpermaße aus allen freigegebenen Quellen). Sie nutzt diese Werte für dein Protokoll und deine Kalorienbilanz. Sie schreibt keine Daten nach Health Connect. Beim Barcode-Scan wird der Produktcode an Open Food Facts zur Produktsuche gesendet; Gesundheits- und Mahlzeitendaten werden nicht übertragen.\n\n" +
                     "Manuelle Einträge, Einstellungen und importierte Werte werden lokal gespeichert. Den Lesezugriff kannst du in Health Connect widerrufen. In den App-Einstellungen kannst du bisher importierte Garmin-Daten löschen."
             })
         })

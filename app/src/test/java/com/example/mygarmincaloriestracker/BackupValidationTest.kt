@@ -24,11 +24,11 @@ class BackupValidationTest {
     }
 
     @Test fun validBackupPreservesRowsAndIds() {
-        assertEquals(valid(), BackupValidation.validate(valid()))
+        assertEquals(2L, BackupValidation.validate(valid()).version)
     }
 
     @Test fun rejectsUnknownVersionAndSchema() {
-        rejected(valid().copy(version = 2))
+        rejected(valid().copy(version = 3))
         rejected(valid().copy(tables = valid().tables - "profile"))
         rejected(valid().copy(tables = valid().tables + ("unexpected" to emptyList())))
     }

@@ -77,6 +77,7 @@ internal data class LatestMeasurements(
     val weight: Pair<LocalDate, Double>?,
     val waist: Pair<LocalDate, Double>?,
     val hip: Pair<LocalDate, Double>?,
+    val bodyFat: Pair<LocalDate, Double>? = null,
 )
 
 @RequiresApi(26)
@@ -117,11 +118,12 @@ internal class TrackerViews(private val context: Context) {
         fun latestMetric(provided: Pair<LocalDate, Double>?, value: (Body) -> Double?): Pair<LocalDate, Double>? =
             (listOfNotNull(provided) + listOfNotNull(data.body, data.latestBody).mapNotNull { body ->
                 value(body)?.let { body.day to it }
-            }).filter { (date, amount) -> date <= cutoffDate && amount.isFinite() && amount > 0 }
+            }).filter { (date, amount) -> date <= cutoffDate && amount.isFinite() && amount >= 0 }
                 .maxByOrNull { it.first }
         val weight = latestMetric(measurements?.weight) { it.weight }
         val waist = latestMetric(measurements?.waist) { it.waist }
         val hip = latestMetric(measurements?.hip) { it.hip }
+        val bodyFat = latestMetric(measurements?.bodyFat) { it.bodyFat }
         val energy = TrackerMath.energy(data, now)
         val intake = recordedIntake(data, now, energy)
         addView(label(if (data.day == now.toLocalDate()) "Tagesübersicht" else "Tagesprotokoll", 14, primary, bold = true))
@@ -164,6 +166,7 @@ internal class TrackerViews(private val context: Context) {
         }.statisticsLink("Verlauf der geschätzten Gewichtsänderung") { onStatistics(StatsTarget.CHANGE) }
         card("Körpermaße") {
             metric("Gewicht", weight?.second, "kg", weight?.first)
+            metric("Körperfett", bodyFat?.second, "%", bodyFat?.first)
             metric("Taille", waist?.second, "cm", waist?.first)
             metric("Hüfte", hip?.second, "cm", hip?.first)
             val height = data.profile.height?.takeIf { it.isFinite() && it > 0 }
@@ -182,7 +185,7 @@ internal class TrackerViews(private val context: Context) {
                 }
                 addView(label(hint, 13, muted), margins(top = 8))
             }
-            if (weight == null && waist == null && hip == null) {
+            if (weight == null && waist == null && hip == null && bodyFat == null) {
                 addView(label("Trage über + deine erste Messung ein.", 14, muted), margins(top = 10))
             }
         }.statisticsLink("Verlauf der Körpermaße") { onStatistics(StatsTarget.BODY) }
@@ -294,7 +297,7 @@ internal class TrackerViews(private val context: Context) {
         val metrics = listOf(
             Metric("Aufnahme", "kcal", primary, 0), Metric("Verbrauch", "kcal", burnColor, 0),
             Metric("Geschätzte Gewichtsänderung", "kg", ink, 2, signed = true),
-            Metric("Gewicht", "kg", primary, 2), Metric("Taille", "cm", primary, 1), Metric("Hüfte", "cm", primary, 1),
+            Metric("Gewicht", "kg", primary, 2), Metric("Taille", "cm", primary, 1), Metric("Hüfte", "cm", primary, 1), Metric("Körperfett", "%", primary, 1),
         )
         val samples = List(metrics.size) { arrayOfNulls<Sample>(slots) }
         val dailyValues = List(metrics.size) { mutableListOf<Pair<LocalDate, Double>>() }
@@ -305,7 +308,7 @@ internal class TrackerViews(private val context: Context) {
             val index = if (yearly) statsMonthIndex(from, day.day) else ChronoUnit.DAYS.between(from, day.day).toInt()
             val energy = TrackerMath.energy(day, now)
             val body = day.body?.takeIf { it.day == day.day }
-            val values = listOf(recordedIntake(day, now, energy), energy.burned, energy.changeKg, body?.weight, body?.waist, body?.hip)
+            val values = listOf(recordedIntake(day, now, energy), energy.burned, energy.changeKg, body?.weight, body?.waist, body?.hip, body?.bodyFat)
             values.forEachIndexed { metric, value ->
                 if (value == null || !value.isFinite()) return@forEachIndexed
                 dailyValues[metric].add(day.day to value)
@@ -357,11 +360,11 @@ internal class TrackerViews(private val context: Context) {
             graph(listOf(series(2)), ticks, from, yearly, includeZero = true, highlightZero = true, monthSlots = months, summary = summary)
         }.tag = StatsTarget.CHANGE
         addView(title("Gemessene Körpermaße", 20), margins(top = 22))
-        (3..5).forEach { index ->
+        (3..6).forEach { index ->
             card(metrics[index].name) {
                 val difference = StatsSummary.difference(dailyValues[index], from, to, today)
                 val summary = if (difference == null) "Änderung: Mindestens 2 Messungen nötig"
-                    else "Änderung: ${quantity(difference, metrics[index].unit, metrics[index].digits, signed = true)}"
+                    else "Änderung: ${quantity(difference, if (index == 6) "Prozentpunkte" else metrics[index].unit, metrics[index].digits, signed = true)}"
                 graph(listOf(series(index)), ticks, from, yearly, includeZero = false, connectGaps = true, monthSlots = months, summary = summary)
             }
                 .apply { if (index == 3) tag = StatsTarget.BODY }

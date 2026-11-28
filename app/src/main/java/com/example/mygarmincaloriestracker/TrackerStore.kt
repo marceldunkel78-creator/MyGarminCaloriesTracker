@@ -29,8 +29,8 @@ data class ActivityEntry(
     val source: String = "Manuell",
 )
 
-/** Weight in kg; waist and hip in cm. */
-data class Body(val day: LocalDate, val weight: Double?, val waist: Double?, val hip: Double?)
+/** Weight in kg; waist and hip in cm; body fat in percent. */
+data class Body(val day: LocalDate, val weight: Double?, val waist: Double?, val hip: Double?, val bodyFat: Double? = null)
 
 /** Height in cm. Manual is daily baseline kcal, including any untracked everyday burn but no tracked workouts. */
 data class Profile(
@@ -65,7 +65,7 @@ class TrackerStore(context: Context) : Closeable {
     /** A single SQLite transaction captures all tables, including committed WAL contents. */
     internal fun backupSnapshot(): BackupData {
         val db = helper.writableDatabase
-        check(db.version == 2) { "Unsupported database version" }
+        check(db.version == 3) { "Unsupported database version" }
         val tables = linkedMapOf<String, List<Map<String, Any?>>>()
         var count = 0
         var textChars = 0L
@@ -107,7 +107,7 @@ class TrackerStore(context: Context) : Closeable {
     internal fun restoreBackup(input: BackupData) {
         val data = BackupValidation.validate(input)
         val db = helper.writableDatabase
-        check(db.version == 2) { "Unsupported database version" }
+        check(db.version == 3) { "Unsupported database version" }
         db.transaction {
             // Delete children before parents; insert parents before children. All names are hard-coded.
             for (table in BACKUP_TABLES.keys.reversed()) delete(table, null, null)
@@ -242,11 +242,29 @@ class TrackerStore(context: Context) : Closeable {
 
     fun saveBody(body: Body) {
         require(listOfNotNull(body.weight, body.waist, body.hip).all { it.isPositive() })
+        require(body.bodyFat == null || (body.bodyFat.isFinite() && body.bodyFat in 0.0..100.0))
         helper.writableDatabase.execSQL(
-            "INSERT OR REPLACE INTO body(day, weight, waist, hip) VALUES (?, ?, ?, ?)",
-            arrayOf<Any?>(body.day.toEpochDay(), body.weight, body.waist, body.hip),
+            "INSERT OR REPLACE INTO body(day, weight, waist, hip, body_fat) VALUES (?, ?, ?, ?, ?)",
+            arrayOf<Any?>(body.day.toEpochDay(), body.weight, body.waist, body.hip, body.bodyFat),
         )
     }
+
+    fun manualBody(day: LocalDate): Body? = helper.readableDatabase.rows(
+        "SELECT $BODY_COLUMNS FROM body WHERE day = ?", arrayOf(day.toEpochDay().toString()),
+    ) { bodyRow() }.firstOrNull()
+
+    /** Only non-null successful reads update the independent imported cache. */
+    fun saveImportedBody(body: Body) {
+        require(body.weight == null || body.weight.isPositive())
+        require(body.bodyFat == null || (body.bodyFat.isFinite() && body.bodyFat in 0.0..100.0))
+        helper.writableDatabase.transaction {
+            val previous = rows("SELECT day, weight, NULL, NULL, body_fat FROM imported_body WHERE day = ?", arrayOf(body.day.toEpochDay().toString())) { bodyRow() }.firstOrNull()
+            execSQL("INSERT OR REPLACE INTO imported_body(day, weight, body_fat) VALUES (?, ?, ?)",
+                arrayOf<Any?>(body.day.toEpochDay(), body.weight ?: previous?.weight, body.bodyFat ?: previous?.bodyFat))
+        }
+    }
+
+    fun clearImportedBody() { helper.writableDatabase.delete("imported_body", null, null) }
 
     fun profile(): Profile = helper.readableDatabase.profileAsOf(LocalDate.now().toEpochDay())
 
@@ -268,10 +286,10 @@ class TrackerStore(context: Context) : Closeable {
         val db = helper.readableDatabase
         val cutoff = minOf(day, LocalDate.now()).toEpochDay().toString()
         fun latest(column: String): Pair<LocalDate, Double>? = db.rows(
-            "SELECT day, $column FROM body WHERE day <= ? AND $column IS NOT NULL ORDER BY day DESC LIMIT 1",
+            "SELECT day, $column FROM effective_body WHERE day <= ? AND $column IS NOT NULL ORDER BY day DESC LIMIT 1",
             arrayOf(cutoff),
         ) { LocalDate.ofEpochDay(getLong(0)) to getDouble(1) }.firstOrNull()
-        return LatestMeasurements(latest("weight"), latest("waist"), latest("hip"))
+        return LatestMeasurements(latest("weight"), latest("waist"), latest("hip"), latest("body_fat"))
     }
 
     /** Counts completed consecutive deficit days ending at the selected date, or yesterday for today. */
@@ -313,7 +331,7 @@ class TrackerStore(context: Context) : Closeable {
             "SELECT day, id, name, minutes, kcal, minute FROM activity WHERE $DAY_RANGE ORDER BY day, minute, id", args,
         ) { getLong(0) to ActivityEntry(getLong(1), getString(2), getInt(3), getDouble(4), getInt(5)) }
             .groupBy({ it.first }, { it.second })
-        val bodies = db.rows("SELECT $BODY_COLUMNS FROM body WHERE $DAY_RANGE", args) { bodyRow() }
+        val bodies = db.rows("SELECT $BODY_COLUMNS FROM effective_body WHERE $DAY_RANGE", args) { bodyRow() }
             .associateBy { it.day.toEpochDay() }
         val importedActivities = db.rows(
             "SELECT day, entry_id, name, minutes, kcal, minute, source FROM garmin_activity " +
@@ -329,7 +347,7 @@ class TrackerStore(context: Context) : Closeable {
         }.toMap()
 
         var latestBody = db.rows(
-            "SELECT $BODY_COLUMNS FROM body WHERE day < ? AND weight IS NOT NULL ORDER BY day DESC LIMIT 1",
+            "SELECT $BODY_COLUMNS FROM effective_body WHERE day < ? AND weight IS NOT NULL ORDER BY day DESC LIMIT 1",
             arrayOf(args[0]),
         ) { bodyRow() }.firstOrNull()
         var baselineProfile = db.profileAsOf(from.toEpochDay())
@@ -378,21 +396,24 @@ private val BACKUP_TABLES = linkedMapOf(
     "sport" to listOf("id", "name", "light", "medium", "hard"),
     "meal" to listOf("id", "day", "name", "grams", "kcal", "minute"),
     "activity" to listOf("id", "day", "name", "minutes", "kcal", "minute"),
-    "body" to listOf("day", "weight", "waist", "hip"),
+    "body" to listOf("day", "weight", "waist", "hip", "body_fat"),
+    "imported_body" to listOf("day", "weight", "body_fat"),
     "profile" to listOf("day", "age", "height", "formula_offset", "manual", "use_garmin", "garmin_total_is_resting"),
     "garmin_day" to listOf("day", "total", "active"),
     "garmin_activity" to listOf("day", "position", "entry_id", "name", "minutes", "kcal", "minute", "source"),
 )
-private val BACKUP_REAL_COLUMNS = setOf("kcal100", "unit_grams", "light", "medium", "hard", "grams", "kcal", "weight", "waist", "hip", "height", "manual", "total", "active")
+private val BACKUP_REAL_COLUMNS = setOf("kcal100", "unit_grams", "light", "medium", "hard", "grams", "kcal", "weight", "waist", "hip", "body_fat", "height", "manual", "total", "active")
 
 private const val DAY_RANGE = "day BETWEEN ? AND ?"
-private const val BODY_COLUMNS = "day, weight, waist, hip"
+private const val BODY_COLUMNS = "day, weight, waist, hip, body_fat"
+private const val CREATE_IMPORTED_BODY = "CREATE TABLE imported_body (day INTEGER PRIMARY KEY, weight REAL, body_fat REAL)"
+private const val CREATE_EFFECTIVE_BODY = "CREATE VIEW effective_body AS SELECT day, MAX(weight) AS weight, MAX(waist) AS waist, MAX(hip) AS hip, MAX(body_fat) AS body_fat FROM (SELECT b.day, COALESCE(b.weight, i.weight) AS weight, b.waist, b.hip, COALESCE(b.body_fat, i.body_fat) AS body_fat FROM body b LEFT JOIN imported_body i ON b.day = i.day UNION ALL SELECT i.day, i.weight, NULL, NULL, i.body_fat FROM imported_body i WHERE NOT EXISTS (SELECT 1 FROM body b WHERE b.day = i.day)) GROUP BY day"
 // Retain the obsolete column for backwards-compatible database and backup round trips; ignore its value.
 private const val PROFILE_COLUMNS = "age, height, formula_offset, manual, use_garmin, garmin_total_is_resting"
 private const val INSERT_FOOD = "INSERT INTO food(name, kcal100, unit_name, unit_grams) VALUES (?, ?, ?, ?)"
 private const val INSERT_SPORT = "INSERT INTO sport(name, light, medium, hard) VALUES (?, ?, ?, ?)"
 
-private class TrackerOpenHelper(context: Context) : SQLiteOpenHelper(context, "tracker.db", null, 2) {
+private class TrackerOpenHelper(context: Context) : SQLiteOpenHelper(context, "tracker.db", null, 3) {
     override fun onConfigure(db: SQLiteDatabase) {
         db.setForeignKeyConstraintsEnabled(true)
     }
@@ -404,7 +425,9 @@ private class TrackerOpenHelper(context: Context) : SQLiteOpenHelper(context, "t
         db.execSQL("CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, day INTEGER NOT NULL, name TEXT NOT NULL, minutes INTEGER NOT NULL, kcal REAL NOT NULL, minute INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX meal_day_minute ON meal(day, minute)")
         db.execSQL("CREATE INDEX activity_day_minute ON activity(day, minute)")
-        db.execSQL("CREATE TABLE body (day INTEGER PRIMARY KEY, weight REAL, waist REAL, hip REAL)")
+        db.execSQL("CREATE TABLE body (day INTEGER PRIMARY KEY, weight REAL, waist REAL, hip REAL, body_fat REAL)")
+        db.execSQL(CREATE_IMPORTED_BODY)
+        db.execSQL(CREATE_EFFECTIVE_BODY)
         db.execSQL("CREATE TABLE profile (day INTEGER PRIMARY KEY, age INTEGER, height REAL, formula_offset INTEGER, manual REAL, use_garmin INTEGER NOT NULL, garmin_total_is_resting INTEGER NOT NULL DEFAULT 0)")
         db.execSQL("CREATE TABLE garmin_day (day INTEGER PRIMARY KEY, total REAL, active REAL)")
         db.execSQL("""
@@ -439,11 +462,11 @@ private class TrackerOpenHelper(context: Context) : SQLiteOpenHelper(context, "t
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion == 1 && newVersion == 2) {
-            db.execSQL("ALTER TABLE profile ADD COLUMN garmin_total_is_resting INTEGER NOT NULL DEFAULT 0")
-        } else {
-            error("Missing tracker database migration: $oldVersion -> $newVersion")
-        }
+        require(oldVersion in 1..2 && newVersion == 3) { "Missing tracker database migration: $oldVersion -> $newVersion" }
+        if (oldVersion == 1) db.execSQL("ALTER TABLE profile ADD COLUMN garmin_total_is_resting INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE body ADD COLUMN body_fat REAL")
+        db.execSQL(CREATE_IMPORTED_BODY)
+        db.execSQL(CREATE_EFFECTIVE_BODY)
     }
 }
 
@@ -485,7 +508,7 @@ private fun Double.isNonNegative() = isFinite() && this >= 0.0
 private fun Cursor.doubleOrNull(index: Int) = if (isNull(index)) null else getDouble(index)
 private fun Cursor.intOrNull(index: Int) = if (isNull(index)) null else getInt(index)
 @RequiresApi(26)
-private fun Cursor.bodyRow() = Body(LocalDate.ofEpochDay(getLong(0)), doubleOrNull(1), doubleOrNull(2), doubleOrNull(3))
+private fun Cursor.bodyRow() = Body(LocalDate.ofEpochDay(getLong(0)), doubleOrNull(1), doubleOrNull(2), doubleOrNull(3), doubleOrNull(4))
 private fun Cursor.profileRow(offset: Int) = Profile(intOrNull(offset), doubleOrNull(offset + 1),
     intOrNull(offset + 2), doubleOrNull(offset + 3), getInt(offset + 4) != 0)
 

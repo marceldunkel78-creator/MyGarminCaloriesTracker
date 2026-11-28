@@ -54,6 +54,46 @@ class TrackerBackupInstrumentedTest {
     }
 
     @Test
+    fun upgradesVersionTwoWithoutLosingMeasurements() {
+        requireNotNull(store).close()
+        SQLiteDatabase.openOrCreateDatabase(databaseFile, null).use { db ->
+            db.execSQL("CREATE TABLE body(day INTEGER PRIMARY KEY, weight REAL, waist REAL, hip REAL)")
+            db.execSQL("INSERT INTO body VALUES (${day.toEpochDay()}, 70, 80, 90)")
+            db.version = 2
+        }
+        store = TrackerStore(isolatedContext)
+        assertEquals(Body(day, 70.0, 80.0, 90.0), requireNotNull(store).manualBody(day))
+        requireNotNull(store).saveImportedBody(Body(day, null, null, null, 20.0))
+        openTestDatabase().use { db ->
+            db.rawQuery("SELECT body_fat FROM effective_body WHERE day = ?", arrayOf(day.toEpochDay().toString())).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(20.0, cursor.getDouble(0), 0.0)
+            }
+        }
+    }
+
+    @Test
+    fun bodyImportPreservesManualValuesAndBackupAndCanBeCleared() {
+        val tracker = requireNotNull(store)
+        tracker.saveBody(Body(day, 70.0, 80.0, null, 20.0))
+        tracker.saveImportedBody(Body(day, 72.0, null, null, 24.0))
+        assertEquals(Body(day, 70.0, 80.0, null, 20.0), tracker.day(day).body)
+        tracker.saveBody(Body(day, null, 80.0, null, null))
+        assertEquals(Body(day, 72.0, 80.0, null, 24.0), tracker.day(day).body)
+        tracker.saveImportedBody(Body(day, null, null, null, 25.0))
+        assertEquals(72.0, requireNotNull(tracker.day(day).body?.weight), 0.0)
+        val backup = BackupJson.read(BackupJson.encode(tracker.backupSnapshot()).inputStream())
+        tracker.clearImportedBody()
+        assertEquals(null, tracker.day(day).body?.weight)
+        tracker.restoreBackup(backup)
+        assertEquals(25.0, requireNotNull(tracker.day(day).body?.bodyFat), 0.0)
+        assertEquals(80.0, requireNotNull(tracker.manualBody(day)?.waist), 0.0)
+        tracker.saveBody(Body(day.plusDays(1), null, null, null, 19.0))
+        assertEquals(day.plusDays(1) to 19.0, tracker.latestMeasurements(day.plusDays(1)).bodyFat)
+        assertEquals(day to 25.0, tracker.latestMeasurements(day).bodyFat)
+    }
+
+    @Test
     fun isolatedContextRoutesTrackerStoreToTemporaryDatabase() {
         val tracker = requireNotNull(store)
         val callsBefore = isolatedContext.pathRequests + isolatedContext.openRequests
@@ -150,8 +190,8 @@ class TrackerBackupInstrumentedTest {
         val invalidDocuments = listOf(
             encoded.dropLast(1),
             encoded + "{}",
-            encoded.replace("\"version\":1", "\"version\":1,\"version\":1"),
-            encoded.replace("\"version\":1", "\"version\":2"),
+            encoded.replace("\"version\":2", "\"version\":2,\"version\":2"),
+            encoded.replace("\"version\":2", "\"version\":3"),
             encoded.replace("\"minute\":480", "\"minute\":1440"),
         )
         assertTrue(encoded.contains("\"minute\":480"))
@@ -185,7 +225,8 @@ class TrackerBackupInstrumentedTest {
         tracker.addMeal(day, "Measured meal", 75.0, 92.625, 480)
         tracker.addDirectMeal(day, "Direct meal", 250.0, 720)
         tracker.addActivity(day, "Manual activity", 30, 180.0, 900)
-        tracker.saveBody(Body(day, 71.5, null, 98.5))
+        tracker.saveBody(Body(day, 71.5, null, 98.5, 22.0))
+        tracker.saveImportedBody(Body(day, 72.0, null, null, 23.0))
         // Profile revisions are keyed by the actual local save date.
         tracker.saveProfile(Profile(35, 175.5, -50, 2100.0, true))
         tracker.saveGarmin(day, GarminDay(2300.0, null, listOf(

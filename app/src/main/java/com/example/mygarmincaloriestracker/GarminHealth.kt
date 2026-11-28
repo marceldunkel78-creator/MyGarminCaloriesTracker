@@ -9,6 +9,8 @@ import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.aggregate.AggregateMetric
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
+import androidx.health.connect.client.records.WeightRecord
+import androidx.health.connect.client.records.BodyFatRecord
 import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
@@ -26,6 +28,7 @@ import java.text.NumberFormat
 import java.util.Locale
 import java.util.UUID
 import kotlin.reflect.KClass
+import kotlinx.coroutines.CancellationException
 
 @RequiresApi(Build.VERSION_CODES.O) // java.time; Garmin sync itself is gated to Android 14.
 internal class GarminHealth(context: Context) {
@@ -44,6 +47,38 @@ internal class GarminHealth(context: Context) {
 
     data class ReadResult(val data: GarminDay, val details: String = "")
 
+    data class BodyReadResult(val body: Body, val partialFailure: Boolean)
+
+    /** Reads the selected device-local calendar day from all sources; never deletes cached data. */
+    suspend fun readBody(day: LocalDate): BodyReadResult {
+        val client = HealthConnectClient.getOrCreate(appContext)
+        val grants = client.permissionController.getGrantedPermissions()
+        val zone = ZoneId.systemDefault()
+        val start = day.atStartOfDay(zone).toInstant()
+        val end = day.plusDays(1).atStartOfDay(zone).toInstant()
+        suspend fun <T : Record> all(type: KClass<T>): List<T> {
+            val result = mutableListOf<T>()
+            var token: String? = null
+            do {
+                val page = client.readRecords(ReadRecordsRequest(recordType = type, timeRangeFilter = TimeRangeFilter.between(start, end), pageToken = token))
+                result.addAll(page.records)
+                token = page.pageToken
+            } while (token != null)
+            return result
+        }
+        var failed = false
+        suspend fun <T> safely(block: suspend () -> T): T? = try { block() }
+        catch (e: CancellationException) { throw e }
+        catch (_: Exception) { failed = true; null }
+        val weight = if (readWeight in grants) safely { all(WeightRecord::class)
+            .filter { it.weight.inKilograms.isFinite() && it.weight.inKilograms > 0 }
+            .maxWithOrNull(compareBy<WeightRecord> { it.time }.thenBy { it.metadata.id })?.weight?.inKilograms } else null
+        val fat = if (readBodyFat in grants) safely { all(BodyFatRecord::class)
+            .filter { it.percentage.value.isFinite() && it.percentage.value in 0.0..100.0 }
+            .maxWithOrNull(compareBy<BodyFatRecord> { it.time }.thenBy { it.metadata.id })?.percentage?.value } else null
+        return BodyReadResult(Body(day, weight, null, null, fat), failed)
+    }
+
     /** A null total means Garmin's stored total records don't substantiate a usable day value. */
     suspend fun read(day: LocalDate, includeDetails: Boolean = false): ReadResult {
         check(available()) { "Garmin's Health Connect bridge is unavailable on this device." }
@@ -53,7 +88,7 @@ internal class GarminHealth(context: Context) {
         val canReadActive = readActive in grants
         val canReadExercise = readExercise in grants
         if (!canReadTotal && !canReadActive && !canReadExercise) {
-            throw SecurityException("Grant at least one Garmin Health Connect read permission.")
+            return ReadResult(GarminDay(null, null, emptyList()))
         }
 
         val zone = ZoneId.systemDefault()
@@ -276,7 +311,9 @@ internal class GarminHealth(context: Context) {
         private val readActive = HealthPermission.getReadPermission(ActiveCaloriesBurnedRecord::class)
         private val readExercise = HealthPermission.getReadPermission(ExerciseSessionRecord::class)
 
-        val permissions: Set<String> = setOf(readTotal, readActive, readExercise)
+        private val readWeight = HealthPermission.getReadPermission(WeightRecord::class)
+        private val readBodyFat = HealthPermission.getReadPermission(BodyFatRecord::class)
+        val permissions: Set<String> = setOf(readTotal, readActive, readExercise, readWeight, readBodyFat)
 
         fun permissionContract(): ActivityResultContract<Set<String>, Set<String>> =
             PermissionController.createRequestPermissionResultContract()

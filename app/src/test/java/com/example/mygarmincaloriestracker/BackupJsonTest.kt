@@ -9,8 +9,8 @@ class BackupJsonTest {
 
     @Test fun parsesEmptyBackup() {
         val result = BackupJson.read(valid().byteInputStream())
-        assertEquals(1L, result.version)
-        assertEquals(8, result.tables.size)
+        assertEquals(2L, result.version)
+        assertEquals(9, result.tables.size)
         assertEquals(result, BackupJson.read(BackupJson.encode(result).inputStream()))
     }
 

@@ -161,7 +161,7 @@ internal object BackupJson {
             }
             out.append('"')
         }
-        out.append("{\"version\":1,\"tables\":{")
+        out.append("{\"version\":${BackupValidation.VERSION},\"tables\":{")
         valid.tables.entries.forEachIndexed { i, (name, rows) ->
             if (i > 0) out.append(',')
             string(name); out.append(":[")

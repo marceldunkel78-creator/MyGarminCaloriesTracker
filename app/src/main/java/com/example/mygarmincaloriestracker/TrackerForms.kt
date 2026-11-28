@@ -397,18 +397,21 @@ internal class TrackerForms(private val context: Context) {
     fun body(existing: Body?, day: LocalDate, onSave: (Body) -> Unit) {
         val form = Form()
         val date = day.format(DateTimeFormatter.ofLocalizedDate(FormatStyle.LONG).withLocale(Locale.GERMANY))
-        form.note("$date · Erfasse nur die Werte, die du gemessen hast.")
+        form.note("$date · Nur manuelle Werte bearbeiten. Leere Felder verwenden gegebenenfalls importierte Werte.")
         val weight = form.input("Gewicht (kg)", Kind.DECIMAL, initial = existing?.weight.asInput())
         val waist = form.input("Taillenumfang (cm)", Kind.DECIMAL, initial = existing?.waist.asInput())
         val hip = form.input("Hüftumfang (cm)", Kind.DECIMAL, initial = existing?.hip.asInput())
+        val fat = form.input("Körperfett (%)", Kind.DECIMAL, initial = existing?.bodyFat.asInput())
         val fields = listOf(weight, waist, hip)
         form.dialog("Körpermaße erfassen") submit@{ dialog ->
-            if (fields.all { it.value.isEmpty() }) return@submit weight.invalid("Gib mindestens einen Messwert ein.")
+            if (existing == null && (fields + fat).all { it.value.isEmpty() }) return@submit weight.invalid("Gib mindestens einen Messwert ein.")
             fields.firstOrNull { it.value.isNotEmpty() && it.number() == null }?.let {
                 return@submit it.invalid("Gib einen Wert größer als 0 ein oder lass das Feld leer.")
             }
+            val bodyFat = fat.number(allowZero = true)
+            if (fat.value.isNotEmpty() && (bodyFat == null || bodyFat > 100)) return@submit fat.invalid("Gib einen Wert zwischen 0 und 100 % ein oder lass das Feld leer.")
             dialog.dismiss()
-            onSave(Body(day, weight.number(), waist.number(), hip.number()))
+            onSave(Body(day, weight.number(), waist.number(), hip.number(), bodyFat))
         }
     }
 
@@ -424,6 +427,7 @@ internal class TrackerForms(private val context: Context) {
         form.note("Öffne unten die Einstellungen. Aktiviere „Garmin-Tageswert bevorzugen“ und tippe auf „Einstellungen speichern“. Öffne danach die Einstellungen erneut und wähle „Health-Connect-Zugriff verwalten“. Erlaube dieser App den Lesezugriff auf Gesamtkalorien, Aktivkalorien und Trainingseinheiten. Du kannst Berechtigungen später in Health Connect ändern.")
         form.note("4 · Daten importieren und prüfen", heading = true)
         form.note("Wähle in der Tagesübersicht den gewünschten Tag. Synchronisiere ihn zuerst in Garmin Connect und wähle anschließend im Menü „Garmin aktualisieren“ oder ziehe die Übersicht nach unten. Vergleiche die Werte mit Garmin Connect. Fehlen Werte, prüfe die Freigaben und versuche es nach der Synchronisierung erneut. Garmin bestimmt, welche Daten bereitgestellt werden.")
+        form.note("Körpermaße: Erlaube in Health Connect den Lesezugriff auf Gewicht und Körperfett und lass deine Quelle diese Werte bereitstellen. Der Import liest den ausgewählten Tag aus allen freigegebenen Quellen, unabhängig vom Garmin-Schalter. Pro Wert zählt die zeitlich letzte Messung im aktuellen lokalen Tag. Manuelle Werte haben am selben Tag Vorrang; leere Felder zeigen importierte Werte. Der Import überschreibt nie manuelle Einträge. Ältere Daten können durch die Health-Connect-Verlaufsbeschränkung fehlen; wähle den betreffenden Tag und prüfe die Freigaben.")
         form.note("5 · Manuell ergänzen", heading = true)
         form.note("Über + kannst du Mahlzeiten, Körpermaße und Aktivitäten erfassen. Manuelle Aktivitäten werden zusätzlich zu Garmin-Gesamt- und Aktivkalorien gezählt – zum Beispiel, wenn du die Uhr nicht getragen hast. Ist dieselbe Aktivität bereits in Garmin enthalten, werden die Kalorien doppelt gezählt. Importierte Garmin-Aktivitäten werden nicht separat addiert.")
         form.note("Ohne nutzbaren Garmin-Gesamtwert verwendet die App eine manuelle Tagesbasis oder eine Schätzung aus den in den Einstellungen und Körpermaßen hinterlegten Angaben. Gesundheitsdaten und Einträge bleiben lokal; die Freigaben kannst du jederzeit widerrufen.")
@@ -486,12 +490,13 @@ internal class TrackerForms(private val context: Context) {
         form.note("Die frühere Option „Garmin-Gesamtwert enthält nur Ruhekalorien“ wird nicht mehr verwendet. Der importierte Gesamtwert gilt immer als Gesamtverbrauch. Dadurch und durch manuelle Aktivitäten können sich auch frühere Tageswerte und Statistiken ändern.")
         if (!garminAvailable) form.note("Health Connect ist für den Garmin-Import auf diesem Gerät derzeit nicht verfügbar.")
         form.note("Erlaube der App den Lesezugriff in Health Connect. Synchronisiere den gewünschten Tag zuerst in Garmin Connect und importiere dann den im Tracker ausgewählten Tag. Diese Aktionen speichern keine Einstellungen.")
+        form.note("Gewicht und Körperfett werden beim Import des ausgewählten Tages aus allen freigegebenen Health-Connect-Quellen gelesen. Pro Tag und Messgröße gewinnt die letzte Messung; manuell gespeicherte Werte haben Vorrang. Leere manuelle Felder nutzen den Import. Ohne zusätzliche Verlaufsberechtigung sind ältere Daten als 30 Tage vor der ersten Freigabe normalerweise nicht lesbar; diese App fordert keine Verlaufsberechtigung an. Widerrufene oder fehlende Freigaben löschen keine gespeicherten Werte.")
         form.button("Health-Connect-Zugriff verwalten", onPermissions).isEnabled = garminAvailable
         form.button("Ausgewählten Tag importieren", onSync).isEnabled = garminAvailable
-        form.button("Importierte Garmin-Daten löschen") {
+        form.button("Importierte Health-Connect-Daten löschen") {
             MaterialAlertDialogBuilder(context)
-                .setTitle("Garmin-Importe löschen?")
-                .setMessage("Alle Garmin-Importe werden aus dem Tracker gelöscht. Manuelle Einträge sowie Daten in Garmin Connect und Health Connect bleiben erhalten.")
+                .setTitle("Health-Connect-Importe löschen?")
+                .setMessage("Alle Garmin- und importierten Körpermessungen werden aus dem Tracker gelöscht. Manuelle Einträge sowie Daten in Garmin Connect und Health Connect bleiben erhalten. Ein späterer Import kann sie erneut laden.")
                 .setNegativeButton("Abbrechen", null)
                 .setPositiveButton("Löschen") { _, _ -> onClear() }
                 .show()
